@@ -16,7 +16,7 @@ pub use faceijk::{FaceIJK, Overage};
 pub use ijk::{CoordIJ, CoordIJK};
 pub use latlng::{LatLng, LatLngIndexer};
 pub use localij::{LocalIJ, LocalIJK};
-pub use row::{GeographicRow, LatLngSegment, RowPath, RowStats};
+pub use row::{GeographicRow, RowPath, RowStats};
 pub use vec3d::Vec3d;
 
 use vec2d::{FaceProjection, Vec2d};
