@@ -1,3 +1,4 @@
+use super::LatLngSegment;
 use super::*;
 use crate::{CellIndex, LatLng, LatLngIndexer, Resolution, math::mul_add};
 
@@ -116,5 +117,85 @@ fn rows_match_to_cell_scattered() {
         let lng0 = mul_add(360.0, next(), -180.0);
         let step = 10_f64.powf(mul_add(3., next(), -5.)); // ~1 m .. ~1 km
         check_row(lat, lng0, step, 3000, &resolutions);
+    }
+}
+
+/// Indexes the segment samples and checks each against `to_cell`.
+fn check_segment(start: LatLng, end: LatLng, count: u64, res: &[Resolution]) {
+    let width = usize::try_from(count).expect("count");
+    let mut cells = vec![vec![None::<CellIndex>; width]; res.len()];
+    let mut path = LatLngSegment::new(start, end, count);
+    LatLngIndexer::new().index_row(
+        &mut path,
+        0..width,
+        res,
+        |i, cols, cell| {
+            for col in cols {
+                assert!(cells[i][col].is_none(), "sample {col} twice");
+                cells[i][col] = Some(cell);
+            }
+        },
+    );
+    for (i, &r) in res.iter().enumerate() {
+        for (col, cell) in cells[i].iter().enumerate() {
+            let ll = path.point(col);
+            assert_eq!(
+                *cell,
+                Some(ll.to_cell(r)),
+                "{start} -> {end} ({count}) sample {col} res {r:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn segments_match_to_cell() {
+    let resolutions = [
+        Resolution::Four,
+        Resolution::Seven,
+        Resolution::Nine,
+        Resolution::Eleven,
+        Resolution::Thirteen,
+    ];
+    let face_center = LatLng::from(Vec3d::new(
+        face::CENTER_POINT[3].x,
+        face::CENTER_POINT[3].y,
+        face::CENTER_POINT[3].z,
+    ));
+    let ll = |lat: f64, lng: f64| LatLng::new(lat, lng).expect("valid");
+    let hard = [
+        // Through a face center, across the antimeridian, near a pole, and
+        // through an icosahedron vertex.
+        (
+            ll(face_center.lat() - 0.3, face_center.lng() - 0.4),
+            ll(face_center.lat() + 0.3, face_center.lng() + 0.4),
+        ),
+        (ll(-10.0, 179.0), ll(-10.5, 181.0)),
+        (ll(89.0, -30.0), ll(89.9, 150.0)),
+        (ll(58.2, 11.0), ll(58.4, 11.5)),
+    ];
+    for (start, end) in hard {
+        for count in [8, 100, 5000] {
+            check_segment(start, end, count, &resolutions);
+        }
+    }
+    let mut next = rng(11);
+    for _ in 0..400 {
+        let lat = mul_add(2.0, next(), -1.0).asin().to_degrees();
+        let lng = mul_add(360.0, next(), -180.0);
+        let len = 10_f64.powf(mul_add(3., next(), -3.)); // 0.001° .. 1°
+        let angle = next() * core::f64::consts::TAU;
+        let start = ll(lat, lng);
+        let end = ll(
+            (lat + len * angle.sin()).clamp(-90., 90.),
+            lng + len * angle.cos(),
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "test"
+        )]
+        let count = 10_f64.powf(mul_add(3., next(), 1.)) as u64; // 10 .. 10k
+        check_segment(start, end, count, &resolutions);
     }
 }

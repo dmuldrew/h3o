@@ -91,6 +91,84 @@ impl RowPath for GeographicRow {
     }
 }
 
+/// `count` samples along a segment that is linear in latitude and longitude
+/// (radians), such as a densified polygon edge.
+///
+/// Sample `i` (for `i` in `0..=count`) is computed exactly as:
+///
+/// ```text
+/// lat = (start.lat * (n - i)).mul_add(1/n, end.lat * i * (1/n))
+/// lng = (start.lng * (n - i)).mul_add(1/n, end.lng * i * (1/n))
+/// ```
+///
+/// with `n = count as f64`, so sample 0 is `start` and sample `count` is
+/// `end`.
+#[derive(Debug, Clone, Copy)]
+pub struct LatLngSegment {
+    start: (f64, f64),
+    end: (f64, f64),
+    count: f64,
+    inv_count: f64,
+    speed: f64,
+    accel: f64,
+}
+
+impl LatLngSegment {
+    /// Initializes `count` samples from `start` towards `end`.
+    ///
+    /// # Panics
+    ///
+    /// If `count` is zero or above 2^53.
+    #[must_use]
+    pub fn new(start: LatLng, end: LatLng, count: u64) -> Self {
+        assert!(count > 0 && count <= 1 << f64::MANTISSA_DIGITS);
+        #[expect(clippy::cast_precision_loss, reason = "checked above")]
+        let count = count as f64;
+        let start = (start.lat_radians(), start.lng_radians());
+        let end = (end.lat_radians(), end.lng_radians());
+        // With φ and λ linear in the sample index:
+        //   |P'| = sqrt(φ'² + cos²φ λ'²) ≤ |φ'| + |λ'|
+        //   |P''| ≤ φ'² + 2|φ'λ'| + λ'² = (|φ'| + |λ'|)²
+        // Slightly inflated to absorb rounding.
+        let rate = (abs(end.0 - start.0) + abs(end.1 - start.1)) / count;
+        let speed = mul_add(rate, 1. + 1e-9, 1e-300);
+        Self {
+            start,
+            end,
+            count,
+            inv_count: 1. / count,
+            speed,
+            accel: speed * speed,
+        }
+    }
+}
+
+impl RowPath for LatLngSegment {
+    #[expect(clippy::cast_precision_loss, reason = "i ≤ count ≤ 2^53")]
+    fn point(&mut self, i: usize) -> LatLng {
+        let i = i as f64;
+        let lat = mul_add(
+            self.start.0 * (self.count - i),
+            self.inv_count,
+            self.end.0 * i * self.inv_count,
+        );
+        let lng = mul_add(
+            self.start.1 * (self.count - i),
+            self.inv_count,
+            self.end.1 * i * self.inv_count,
+        );
+        LatLng::from_radians(lat, lng).expect("finite coordinate")
+    }
+
+    fn speed_bound(&self) -> f64 {
+        self.speed
+    }
+
+    fn accel_bound(&self) -> f64 {
+        self.accel
+    }
+}
+
 // -----------------------------------------------------------------------------
 
 /// Lower bound of `P · n` for any point whose closest face center is `n`: the
