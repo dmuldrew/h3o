@@ -276,3 +276,145 @@ fn segments_match_to_cell() {
         check_segment(start, end, count, &resolutions);
     }
 }
+
+/// A geographic row whose points jitter around the smooth row by up to
+/// `sigma` radians (deterministic per index, like an iterative inverse
+/// projection's tolerance), reporting `reported` as its noise bound.
+struct JitteredRow {
+    row: GeographicRow,
+    sigma: f64,
+    reported: f64,
+    seed: u64,
+}
+
+impl JitteredRow {
+    /// Uniform in [-1, 1), from the index.
+    fn unit(&self, i: usize, salt: u64) -> f64 {
+        let mut z =
+            self.seed ^ salt ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        #[expect(clippy::cast_precision_loss, reason = "test")]
+        let v = (z >> 11) as f64 / (1_u64 << 52) as f64 - 1.;
+        v
+    }
+}
+
+impl RowPath for JitteredRow {
+    fn point(&mut self, i: usize) -> LatLng {
+        let ll = self.row.point(i);
+        let (lat, lng) = (ll.lat_radians(), ll.lng_radians());
+        // Offsets of ≤ σ/2 north-south and east-west: ≤ σ/√2 in angle.
+        let half = 0.5 * self.sigma;
+        LatLng::from_radians(
+            mul_add(half, self.unit(i, 1), lat),
+            mul_add(half / cos(lat), self.unit(i, 2), lng),
+        )
+        .expect("finite coordinate")
+    }
+
+    fn speed_bound(&self) -> f64 {
+        self.row.speed_bound()
+    }
+
+    fn accel_bound(&self) -> f64 {
+        self.row.accel_bound()
+    }
+
+    fn noise_bound(&self) -> f64 {
+        self.reported
+    }
+}
+
+/// Indexes `0..width` and returns the stats and the number of (location,
+/// resolution) pairs that differ from `to_cell`.
+#[expect(clippy::needless_range_loop, reason = "column-major check")]
+fn count_mismatches(
+    path: &mut impl RowPath,
+    width: usize,
+    res: &[Resolution],
+) -> (RowStats, usize) {
+    let mut cells = vec![vec![None::<CellIndex>; width]; res.len()];
+    let stats =
+        LatLngIndexer::new().index_row(path, 0..width, res, |i, cols, cell| {
+            for col in cols {
+                assert!(cells[i][col].is_none(), "column {col} twice");
+                cells[i][col] = Some(cell);
+            }
+        });
+    let mut mismatches = 0;
+    for col in 0..width {
+        let ll = path.point(col);
+        for (i, &r) in res.iter().enumerate() {
+            let cell = cells[i][col].expect("every column indexed");
+            mismatches += usize::from(cell != ll.to_cell(r));
+        }
+    }
+    (stats, mismatches)
+}
+
+fn jittered_rows(reported_as_sigma: bool) -> impl Iterator<Item = JitteredRow> {
+    let mut next = rng(23);
+    (0..80_u64).map(move |seed| {
+        let lat = mul_add(140.0, next(), -70.0);
+        let lng0 = mul_add(360.0, next(), -180.0);
+        let step = 10_f64.powf(mul_add(1.5, next(), -5.)); // ~1 m .. ~35 m
+        let sigma = 10_f64.powf(mul_add(1., next(), -7.5)); // 3e-8 .. 3e-7 rad
+        JitteredRow {
+            row: GeographicRow::new(lat, lng0, step),
+            sigma,
+            reported: if reported_as_sigma { sigma } else { 0. },
+            seed,
+        }
+    })
+}
+
+const JITTER_RESOLUTIONS: [Resolution; 4] = [
+    Resolution::Nine,
+    Resolution::Eleven,
+    Resolution::Twelve,
+    Resolution::Thirteen,
+];
+
+#[test]
+fn jittered_rows_match_to_cell_when_noise_is_reported() {
+    for mut path in jittered_rows(true) {
+        let (stats, mismatches) =
+            count_mismatches(&mut path, 3000, &JITTER_RESOLUTIONS);
+        assert_eq!(mismatches, 0, "sigma {}", path.sigma);
+        assert!(stats.decisions > 0, "interpolation still used");
+    }
+}
+
+// Control: the jitter is large enough to matter, so the test above is
+// meaningful.
+#[test]
+fn jittered_rows_mismatch_when_noise_is_not_reported() {
+    let total = jittered_rows(false)
+        .map(|mut path| {
+            count_mismatches(&mut path, 3000, &JITTER_RESOLUTIONS).1
+        })
+        .sum::<usize>();
+    assert!(total > 0, "jitter never changed a cell");
+}
+
+#[test]
+fn invalid_or_large_noise_falls_back_to_to_cell() {
+    let width = 500;
+    for reported in [f64::NAN, -1e-9, 2e-3] {
+        let mut path = JitteredRow {
+            row: GeographicRow::new(39.7, -105.0, 2.7e-4),
+            sigma: 1e-7,
+            reported,
+            seed: 5,
+        };
+        let (stats, mismatches) =
+            count_mismatches(&mut path, width, &JITTER_RESOLUTIONS);
+        assert_eq!(mismatches, 0, "{reported}");
+        assert_eq!(stats.decisions, 0, "{reported}");
+        assert_eq!(stats.fallbacks, width * JITTER_RESOLUTIONS.len());
+    }
+}
+
+

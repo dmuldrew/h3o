@@ -35,11 +35,25 @@ pub trait RowPath {
     fn point(&mut self, i: usize) -> LatLng;
 
     /// An upper bound on `|dP/di|`, where `P(i)` is the unit vector of
-    /// location `i` (radians per sample).
+    /// location `i` on the smooth path (radians per sample).
     fn speed_bound(&self) -> f64;
 
-    /// An upper bound on `|d²P/di²|` (radians per sample²).
+    /// An upper bound on `|d²P/di²|` on the smooth path (radians per
+    /// sample²).
     fn accel_bound(&self) -> f64;
+
+    /// An upper bound on the angular distance (radians) between `point(i)`
+    /// and the smooth path described by the speed and acceleration bounds.
+    ///
+    /// Closed-form coordinates only deviate by rounding, which the indexer
+    /// already accounts for, so the default is 0. Coordinates computed
+    /// numerically, such as an iterative inverse projection, jitter around
+    /// the smooth path by up to their tolerance: report it here. The margin
+    /// grows accordingly, so results stay exact; values above 1e-3 rad (or
+    /// NaN/negative values) make every location use `to_cell`.
+    fn noise_bound(&self) -> f64 {
+        0.
+    }
 }
 
 /// A row of a geographic (equirectangular) raster: constant latitude,
@@ -116,6 +130,16 @@ const MAX_SPAN_F64: f64 = MAX_SPAN as f64;
 /// Spans closer than this (radians) to a face center are split down to
 /// per-pixel indexing.
 const MIN_FACE_CENTER_DISTANCE: f64 = 1e-6;
+
+/// Largest supported `RowPath::noise_bound` (radians). The plane-error bounds
+/// assume `P · n ≥ W_MIN` for points near the path, which keeps ~7e-3 rad of
+/// slack over the true 0.7947; larger noise falls back to `to_cell`.
+const MAX_NOISE: f64 = 1e-3;
+
+/// Bound on the resolution 0 hex-plane displacement per radian of point
+/// displacement: with `Q = P_perp / w`, `|δQ| ≤ |δP|/w + |P_perp| |δw|/w²`.
+const PLANE_PER_RADIAN: f64 =
+    INV_RES0_U_GNOMONIC * (1. / W_MIN + 1. / (W_MIN * W_MIN));
 
 /// An exactly projected sample.
 #[derive(Debug, Clone, Copy)]
@@ -259,6 +283,8 @@ struct Row<'a, P, E> {
     levels: Vec<Level>,
     speed: f64,
     accel: f64,
+    /// `RowPath::noise_bound`, validated.
+    noise: f64,
     /// `max |Q''|` of the gnomonic plane position along the path, per sample²
     /// (tangent-plane units).
     curvature: f64,
@@ -280,6 +306,9 @@ pub(super) fn index_row(
     }
     let speed = path.speed_bound();
     let accel = path.accel_bound();
+    let noise = path.noise_bound();
+    // NaN, negative or too large: no interpolation at all.
+    let exact_only = !(0. ..=MAX_NOISE).contains(&noise);
     // Q = P_perp / w with |P_perp| ≤ 1, w ≥ W_MIN, |P'|, |w'| ≤ V and
     // |P''|, |w''| ≤ A:
     //   |Q''| ≤ A/w + 2V²/w² + A/w² + 2V²/w³.
@@ -316,10 +345,23 @@ pub(super) fn index_row(
         levels: resolutions.iter().copied().map(Level::new).collect(),
         speed,
         accel,
+        noise,
         curvature,
         last_point: None,
         stats: RowStats::default(),
     };
+
+    if exact_only {
+        for col in cols.clone() {
+            row.exact(col);
+        }
+        for (index, level) in row.levels.iter_mut().enumerate() {
+            if let Some((start, cell)) = level.run.take() {
+                (row.emit)(index, start..cols.end, cell);
+            }
+        }
+        return row.stats;
+    }
 
     let mut a = cols.start;
     let mut sa = row.sample(a);
@@ -363,13 +405,23 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
         let h = (b - a) as f64;
 
         // Every location of the span must have `sa.face` as closest face:
-        // `s_g = P·(c_f - c_g)` is linear in P, so its deviation from the
-        // chord is ≤ h²/8 * |c_f - c_g| * A ≤ h²/4 * A.
+        // `s_g = P·(c_f - c_g)` is linear in P, so on the smooth path its
+        // deviation from the chord is ≤ h²/8 * |c_f - c_g| * A ≤ h²/4 * A.
+        // Point noise σ shifts each `s_g` by ≤ 2σ: at both samples (moving
+        // the chord) and at the location itself, hence 4σ.
         let face_ok = sa.face == sb.face
             && sa.face_margin.min(sb.face_margin)
-                > mul_add(h * h * 0.25, self.accel, 1e-13);
+                > mul_add(
+                    h * h * 0.25,
+                    self.accel,
+                    mul_add(4., self.noise, 1e-13),
+                );
         // ... and stay away from the face center, where `to_cell` is noisy.
-        let r_lo = mul_add(-0.5 * h, self.speed, sa.r.min(sb.r));
+        let r_lo = mul_add(
+            -0.5 * h,
+            self.speed,
+            mul_add(-2., self.noise, sa.r.min(sb.r)),
+        );
         if !face_ok || r_lo < MIN_FACE_CENTER_DISTANCE {
             if b - a >= 2 {
                 let m = a + (b - a) / 2;
@@ -383,10 +435,13 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
         }
 
         // Bound on |true - interpolated| + 2 * float noise, at resolution 0.
+        // Point noise σ moves the interpolated chord (through the samples)
+        // and the location itself by ≤ σ * PLANE_PER_RADIAN each.
         let interpolation =
             INV_RES0_U_GNOMONIC * h * h * 0.125 * self.curvature;
-        let noise = FLOAT_NOISE * (1. + 1. / r_lo);
-        let error0 = mul_add(2., noise, interpolation);
+        let float_noise = FLOAT_NOISE * (1. + 1. / r_lo);
+        let point_noise = 2. * PLANE_PER_RADIAN * self.noise;
+        let error0 = mul_add(2., float_noise, interpolation + point_noise);
 
         let (dx, dy) = ((sb.q.x - sa.q.x) / h, (sb.q.y - sa.q.y) / h);
         for index in 0..self.levels.len() {
