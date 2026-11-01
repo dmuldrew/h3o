@@ -326,7 +326,30 @@ impl LatLngIndexer {
             .map(|(fijk, resolution)| self.encode(fijk, resolution))
     }
 
-    fn encode(&mut self, fijk: FaceIJK, resolution: Resolution) -> CellIndex {
+    /// **Experimental.** Indexes the locations `cols` of `path` at each
+    /// resolution, and reports them as maximal runs of identical cells:
+    /// `emit(resolution_index, columns, cell)`.
+    ///
+    /// Every column gets exactly `path.point(col).to_cell(resolution)`, but
+    /// only a few locations are projected: the hex-plane position is
+    /// interpolated between exact samples and only trusted when it clears a
+    /// proven error bound. Runs are emitted in column order for each
+    /// resolution (resolutions interleave).
+    pub fn index_row(
+        &mut self,
+        path: &mut impl super::RowPath,
+        cols: core::ops::Range<usize>,
+        resolutions: &[Resolution],
+        emit: impl FnMut(usize, core::ops::Range<usize>, CellIndex),
+    ) -> super::RowStats {
+        super::row::index_row(self, path, cols, resolutions, emit)
+    }
+
+    pub(super) fn encode(
+        &mut self,
+        fijk: FaceIJK,
+        resolution: Resolution,
+    ) -> CellIndex {
         let last = &mut self.last[usize::from(resolution)];
         match *last {
             Some((last_fijk, cell)) if last_fijk == fijk => cell,

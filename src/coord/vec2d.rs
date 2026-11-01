@@ -75,6 +75,17 @@ impl FaceProjection {
         }
     }
 
+    /// Returns the Cartesian coordinates in the resolution 0 hex plane (the
+    /// coordinates at resolution `r` are these scaled by `sqrt(7)^r`, and
+    /// rotated for Class III).
+    pub fn res0_xy(self) -> Vec2d {
+        let Some((r0, theta)) = self.polar else {
+            return Vec2d::new(0., 0.);
+        };
+        let (sin_t, cos_t) = sin_cos(theta);
+        Vec2d::new(r0 * cos_t, r0 * sin_t)
+    }
+
     /// Returns the 2D hex coordinates at the given resolution.
     pub fn to_vec2d(self, resolution: Resolution) -> Vec2d {
         self.to_vec2d_with(resolution, sin_cos)
