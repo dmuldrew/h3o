@@ -1,7 +1,7 @@
 use super::neighbors;
 use crate::{
-    CellIndex, LatLng, LatLngIndexer, LatLngSegment, Resolution, RowPath,
-    TWO_PI, error::InvalidGeometry, math::mul_add,
+    CellIndex, LatLng, Resolution, TWO_PI, error::InvalidGeometry,
+    math::mul_add,
 };
 use ahash::{HashSet, HashSetExt};
 use either::Either;
@@ -310,15 +310,12 @@ impl Tiler {
         predicate: &ContainmentPredicate<'_>,
     ) -> Vec<(CellIndex, bool)> {
         // Compute the set of cells making the outlines of the polygon.
-        let mut indexer = LatLngIndexer::new();
-        let mut outlines = Vec::new();
-        for ring in self.interiors().chain(self.exteriors()) {
-            get_edge_cells(ring, resolution, &mut indexer, |cell| {
-                if already_seen.insert(cell) {
-                    outlines.push(cell);
-                }
-            });
-        }
+        let outlines = self
+            .interiors()
+            .chain(self.exteriors())
+            .flat_map(|ring| get_edge_cells(ring, resolution))
+            .filter(|cell| already_seen.insert(*cell))
+            .collect::<Vec<_>>();
         // Reset the `already_seen` set: content can't be trusted because we
         // `get_edge_cells` is based on a rough approximation.
         already_seen.clear();
@@ -602,48 +599,40 @@ fn outermost_inner_cells(
     })
 }
 
-/// Below this many samples per edge, indexing each sample directly is cheaper
-/// than setting up exact row indexing.
-const MIN_ROW_SAMPLES: u64 = 8;
-
-// Pushes the cell indexes that trace the ring outline (rough approximation).
-//
-// Each edge is sampled `line_hex_estimate` times; long edges go through
-// `LatLngIndexer::index_row`, which yields exactly the cells `to_cell` gives
-// for each sample, as runs (consecutive duplicates are collapsed).
+// Return the cell indexes that traces the ring outline (rough approximation)
 fn get_edge_cells(
     ring: &LineString,
     resolution: Resolution,
-    indexer: &mut LatLngIndexer,
-    mut push: impl FnMut(CellIndex),
-) {
-    for line @ Line { start, end } in ring.lines() {
+) -> impl Iterator<Item = CellIndex> + '_ {
+    ring.lines().flat_map(move |line @ Line { start, end }| {
         let count = line_hex_estimate(&line, resolution);
 
         assert!(count <= 1 << f64::MANTISSA_DIGITS);
-        let mut samples = LatLngSegment::new(
-            LatLng::from_radians(start.y, start.x)
-                .expect("finite line coordinate"),
-            LatLng::from_radians(end.y, end.x).expect("finite line coordinate"),
-            count,
-        );
-        if count < MIN_ROW_SAMPLES {
-            for i in 0..count {
-                let i = usize::try_from(i).expect("small sample index");
-                push(samples.point(i).to_cell(resolution));
-            }
-        } else {
-            let count = usize::try_from(count).expect("sample count");
-            indexer.index_row(
-                &mut samples,
-                0..count,
-                &[resolution],
-                |_, _, cell| {
-                    push(cell);
-                },
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "cannot happen thanks to assert above"
+        )]
+        (0..count).map(move |i| {
+            let i = i as f64;
+            let count = count as f64;
+            let inv_count = 1. / count;
+
+            let lat = mul_add(
+                start.y * (count - i),
+                inv_count,
+                end.y * i * inv_count,
             );
-        }
-    }
+            let lng = mul_add(
+                start.x * (count - i),
+                inv_count,
+                end.x * i * inv_count,
+            );
+
+            LatLng::from_radians(lat, lng)
+                .expect("finite line coordinate")
+                .to_cell(resolution)
+        })
+    })
 }
 
 /// Returns an estimated number of hexagons that trace the cartesian-projected
