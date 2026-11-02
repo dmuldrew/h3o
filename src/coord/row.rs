@@ -46,12 +46,15 @@ pub trait RowPath {
     /// An upper bound on the angular distance (radians) between `point(i)`
     /// and the smooth path described by the speed and acceleration bounds.
     ///
-    /// Closed-form coordinates only deviate by rounding, which the indexer
-    /// already accounts for, so the default is 0. Coordinates computed
-    /// numerically, such as an iterative inverse projection, jitter around
-    /// the smooth path by up to their tolerance: report it here. The margin
-    /// grows accordingly, so results stay exact; values above 1e-3 rad (or
-    /// NaN/negative values) make every location use `to_cell`.
+    /// The indexer already allows `64 * f64::EPSILON` rad (≈ 1.4e-14 rad, or
+    /// ~0.1 nm) on top of this, which covers the rounding of a handful of
+    /// closed-form operations on coordinates in radians or degrees (e.g. a
+    /// longitude computed as `lng0 + step * i`, ≈ 2 ulp of π): the default is
+    /// 0. Coordinates computed numerically, such as an iterative inverse
+    /// projection, or through a long chain of operations, deviate from the
+    /// smooth path by more: report it here. The margin grows accordingly, so
+    /// results stay exact; values above 1e-3 rad (or NaN/negative values)
+    /// make every location use `to_cell`.
     fn noise_bound(&self) -> f64 {
         0.
     }
@@ -146,16 +149,53 @@ impl RowPath for GeographicRow {
 
 // -----------------------------------------------------------------------------
 
-/// Lower bound of `P · n` for any point whose closest face center is `n`: the
-/// farthest such point is an icosahedron vertex, 37.38° away (cos = 0.7947).
+// Constants that exactness depends on.
+
+/// `cos` of the angular radius of a face: the farthest point whose closest
+/// face center is `n` is an icosahedron vertex, `acos(√((5 + 2√5) / 15))` ≈
+/// 37.38° away.
+const COS_FACE_RADIUS: f64 = 0.794_654_472_291_766;
+
+/// Lower bound of `P · n` used by the plane-error bounds, for points within
+/// `MAX_NOISE` of a point whose closest face center is `n`.
 const W_MIN: f64 = 0.79;
 
-/// Estimated bound of `to_cell`'s own floating-point error on the resolution 0
-/// hex-plane position, as a multiple of `f64::EPSILON * (1 + 1/r)`, where `r`
-/// is the angular distance to the face center (`acos` near 1 and the azimuth
-/// are ill-conditioned close to the face center). A handful of libm calls with
-/// ≤ 2 ulp error each are involved; this is deliberately loose.
-const FLOAT_NOISE: f64 = 256. * f64::EPSILON;
+/// Largest supported `RowPath::noise_bound` (radians); larger noise falls
+/// back to `to_cell`. A point within `MAX_NOISE` of a location whose closest
+/// face center is `n` has `P · n ≥ COS_FACE_RADIUS - MAX_NOISE ≥ W_MIN`.
+const MAX_NOISE: f64 = 1e-3;
+const _: () = assert!(MAX_NOISE + ROUNDING_NOISE <= COS_FACE_RADIUS - W_MIN);
+
+/// Bound on `to_cell`'s own floating-point error on the resolution 0
+/// hex-plane position (and, scaled by `√7ʳ`, at resolution `r`), as a
+/// multiple of `f64::EPSILON * (1 + 1/r)`, where `r` is the angular distance
+/// to the face center.
+///
+/// The error is `a ε + b ε / r`:
+/// - `b ε / r` comes from rounding `1 - d²/2` (≤ ε/4) before `acos`, whose
+///   slope is `1 / sin r`: `b = INV_RES0_U_GNOMONIC / 4 ≈ 0.65`. Nothing else
+///   is ill-conditioned near the face center: the azimuth's angle error
+///   (~ε / sin r) is multiplied by the gnomonic radius (~tan r).
+/// - `a ε` collects the rest (n-vector, `tan`, azimuth, `sin_cos`, Class III
+///   rotation, scaling), each a few ulps amplified by at most
+///   `PLANE_PER_RADIAN` ≈ 7.5: a worst-case sum is around `a ≈ 50`.
+///
+/// Measured against a 40-digit evaluation of the same projection on 100,000
+/// points (uniform, and log-spaced down to 3e-7 rad from face centers), at
+/// resolutions 0, 14 and 15: `a ≤ 3.75` and `b = 0.65`. 256 is far above
+/// both, and still costs nothing: at resolution 15 the resulting margin is
+/// ~5e-7 hex units against `TARGET_MARGIN`.
+const TO_CELL_NOISE: f64 = 256. * f64::EPSILON;
+
+/// Point noise (radians) allowed on top of `RowPath::noise_bound`, so that
+/// closed-form paths can report 0: rounding of a few operations on
+/// coordinates, e.g. ≈ 2 ulp of π for `lng0 + step * i` and the degree to
+/// radian conversion.
+const ROUNDING_NOISE: f64 = 64. * f64::EPSILON;
+
+// Performance-only constants: the error margin of a span is computed from its
+// actual length and distance to the face center, so any positive value keeps
+// results exact.
 
 /// Margin, in hex units at the finest resolution, that spans are sized for.
 /// About `4 * TARGET_MARGIN` of the samples fall back to `to_cell`.
@@ -167,13 +207,9 @@ const MAX_SPAN: usize = 1024;
 const MAX_SPAN_F64: f64 = MAX_SPAN as f64;
 
 /// Spans closer than this (radians) to a face center are split down to
-/// per-pixel indexing.
+/// per-pixel indexing (the `1/r` term of `TO_CELL_NOISE` would leave little
+/// room anyway).
 const MIN_FACE_CENTER_DISTANCE: f64 = 1e-6;
-
-/// Largest supported `RowPath::noise_bound` (radians). The plane-error bounds
-/// assume `P · n ≥ W_MIN` for points near the path, which keeps ~7e-3 rad of
-/// slack over the true 0.7947; larger noise falls back to `to_cell`.
-const MAX_NOISE: f64 = 1e-3;
 
 /// Bound on the resolution 0 hex-plane displacement per radian of point
 /// displacement: with `Q = P_perp / w`, `|δQ| ≤ |δP|/w + |P_perp| |δw|/w²`.
@@ -280,6 +316,47 @@ impl Level {
 
 /// Distance from `q` to the boundary of the hexagon `ijk` (unit spacing
 /// between hex centers, so the apothem is 0.5); negative if outside.
+///
+/// # Hex rounding
+///
+/// Exactness needs `CoordIJK::from(Vec2d)` to return the hexagon containing
+/// `to_cell`'s position whenever that position is inside it by more than the
+/// rounding slack. (On the interpolated side it is checked: a wrong hexagon
+/// would give a negative `hex_margin` and fall back.) In exact arithmetic it
+/// returns the nearest lattice point:
+///
+/// - It works on `|x|, |y|` in axial coordinates `x2 = |y| / sin 60°`,
+///   `x1 = |x| + x2 / 2`, where hexagon `(i, j, 0)` is centered at
+///   `(x1, x2) = (i, j)`, and splits them into integer parts `(m1, m2)` and
+///   fractional parts `(r1, r2)`. The nearest center is then one of the
+///   corners `(0,0)`, `(1,0)`, `(0,1)`, `(1,1)` of the unit cell (relative to
+///   `(m1, m2)`): the squared distance to `(i, j)` is
+///   `(r1-i)² - (r1-i)(r2-j) + (r2-j)²`, and the corners' Voronoi cells
+///   cover the unit cell.
+/// - The bisectors between corners are `r2 = 2 r1 - 1` for (0,0)|(1,0),
+///   `r2 = (1 + r1) / 2` for (0,0)|(0,1), `r1 + r2 = 1` for (0,0)|(1,1),
+///   `r2 = r1 / 2` for (1,0)|(1,1) and `r2 = 2 r1` for (0,1)|(1,1);
+///   (1,0) and (0,1) are not neighbors.
+/// - `r1 < 1/3`: (1,0) would need `r2 < 2 r1 - 1 < 0`, and (1,1) would need
+///   `r2 > 1 - r1 > 2/3 > 2 r1`: the code picks between (0,0) and (0,1) by
+///   `r2 ≥ (1 + r1) / 2`.
+/// - `r1 ≥ 2/3`: (0,0) would need `2 r1 - 1 < r2 < 1 - r1`, impossible, and
+///   (0,1) `r2 > 2 r1 ≥ 4/3`: the code picks between (1,0) and (1,1) by
+///   `r2 ≥ r1 / 2`.
+/// - `1/3 ≤ r1 < 2/3`: `r2 < 1 - r1` selects the lower pair; there (0,1)
+///   never wins since `1 - r1 ≤ (1 + r1) / 2`, and the code splits (0,0)
+///   from (1,0) by `r2 ≤ 2 r1 - 1` (which is never true for `r1 < 1/2`).
+///   Otherwise (1,0) never wins since `1 - r1 > r1 / 2`, and the code splits
+///   (0,1) from (1,1) by `r2 < 2 r1` (always true for `r1 ≥ 1/2`).
+/// - Folding back the signs applies the lattice reflections: `x → -x` maps
+///   `(i, j)` to `(j - i, j)` and `y → -y` maps it to `(i - j, -j)`.
+///
+/// In floating point, the integer and fractional parts are exact, the
+/// thresholds round by at most ε, and `x1, x2` by ~3 ulp of `|q|`. A move of
+/// `(δ1, δ2)` in axial coordinates moves the point by at most `|δ1| + |δ2|`
+/// relative to any bisector (the bisector distances are `|2 r1 - r2 - 1| / 2`
+/// and similar), so the slack is about `4ε |q| + 2ε`, within the `16ε (1 + |q|)` term of the margin (itself
+/// far below the scaled `TO_CELL_NOISE`).
 fn hex_margin(q: Vec2d, ijk: CoordIJK) -> f64 {
     let center = Vec2d::from(ijk);
     let (ox, oy) = (q.x - center.x, q.y - center.y);
@@ -324,6 +401,7 @@ pub struct RowStats {
 struct Bounds {
     speed: f64,
     accel: f64,
+    /// The reported noise bound plus `ROUNDING_NOISE`.
     noise: f64,
     /// `max |Q''|` of the gnomonic plane position along the path, per sample²
     /// (tangent-plane units).
@@ -357,7 +435,7 @@ impl Bounds {
         Some(Self {
             speed,
             accel,
-            noise,
+            noise: noise + ROUNDING_NOISE,
             curvature,
         })
     }
@@ -523,7 +601,7 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
         // and the location itself by ≤ σ * PLANE_PER_RADIAN each.
         let interpolation =
             INV_RES0_U_GNOMONIC * h * h * 0.125 * bounds.curvature;
-        let float_noise = FLOAT_NOISE * (1. + 1. / r_lo);
+        let float_noise = TO_CELL_NOISE * (1. + 1. / r_lo);
         let point_noise = 2. * PLANE_PER_RADIAN * bounds.noise;
         let error0 = mul_add(2., float_noise, interpolation + point_noise);
 
