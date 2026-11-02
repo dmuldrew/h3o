@@ -155,6 +155,10 @@ impl FaceIJK {
     /// Completes a cell index from its resolution 0 `FaceIJK` address (`self`)
     /// and its unrotated direction digits: base cell lookup and rotation into
     /// the base cell's canonical orientation.
+    #[expect(
+        clippy::inline_always,
+        reason = "keeps `to_cell` as fast as before the split (~40% otherwise)"
+    )]
     #[inline(always)]
     fn finish_cell(self, mut bits: u64) -> CellIndex {
         // Lookup the correct base cell.
@@ -631,6 +635,10 @@ fn directions_bits_from_ijk(
 
 /// Returns the `IJK` coordinates of the parent (at `res - 1`) of the cell at
 /// `ijk` (at `res`), and the direction digit of that cell at `res`.
+#[expect(
+    clippy::inline_always,
+    reason = "keeps `to_cell` as fast as before the split (~40% otherwise)"
+)]
 #[inline(always)]
 fn parent_and_direction(
     ijk: CoordIJK,
