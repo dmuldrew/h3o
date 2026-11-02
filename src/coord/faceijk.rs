@@ -155,6 +155,7 @@ impl FaceIJK {
     /// Completes a cell index from its resolution 0 `FaceIJK` address (`self`)
     /// and its unrotated direction digits: base cell lookup and rotation into
     /// the base cell's canonical orientation.
+    #[inline(always)]
     fn finish_cell(self, mut bits: u64) -> CellIndex {
         // Lookup the correct base cell.
         let rotation = self.base_cell_rotation();
@@ -630,6 +631,7 @@ fn directions_bits_from_ijk(
 
 /// Returns the `IJK` coordinates of the parent (at `res - 1`) of the cell at
 /// `ijk` (at `res`), and the direction digit of that cell at `res`.
+#[inline(always)]
 fn parent_and_direction(
     ijk: CoordIJK,
     res: Resolution,
