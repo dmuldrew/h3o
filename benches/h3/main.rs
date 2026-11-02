@@ -43,6 +43,7 @@ mod grid_path_cells;
 mod grid_path_cells_size;
 mod grid_ring_unsafe;
 mod h3_to_string;
+mod index_row;
 mod is_pentagon;
 mod is_res_class3;
 mod is_valid_cell;
@@ -124,6 +125,7 @@ criterion_group!(
     get_res0_cells::bench,
     get_resolution::bench,
     h3_to_string::bench,
+    index_row::bench,
     is_pentagon::bench_hexagons,
     is_pentagon::bench_pentagons,
     is_res_class3::bench,
