@@ -1,4 +1,4 @@
-use super::{EPSILON_RAD, FaceIJK, FaceProjection, Vec3d};
+use super::{EPSILON_RAD, EncodeCache, FaceIJK, FaceProjection, Vec3d};
 use crate::{
     CellIndex, EARTH_RADIUS_KM, Resolution,
     error::InvalidLatLng,
@@ -296,6 +296,9 @@ impl LatLng {
 pub struct LatLngIndexer {
     /// Last `FaceIJK` address and cell at each resolution.
     last: [Option<(FaceIJK, CellIndex)>; h3o_bit::MAX_RESOLUTION as usize + 1],
+    /// Ancestors and digits of the last encoded cell at each resolution, so
+    /// that a new cell only recomputes the digits it doesn't share with it.
+    encoded: [EncodeCache; h3o_bit::MAX_RESOLUTION as usize + 1],
 }
 
 impl LatLngIndexer {
@@ -354,7 +357,10 @@ impl LatLngIndexer {
         match *last {
             Some((last_fijk, cell)) if last_fijk == fijk => cell,
             _ => {
-                let cell = fijk.to_cell(resolution);
+                let cell = fijk.to_cell_cached(
+                    resolution,
+                    &mut self.encoded[usize::from(resolution)],
+                );
                 *last = Some((fijk, cell));
                 cell
             }

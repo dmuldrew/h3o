@@ -12,7 +12,7 @@ mod vec2d;
 mod vec3d;
 
 pub use cube::CoordCube;
-pub use faceijk::{FaceIJK, Overage};
+pub use faceijk::{EncodeCache, FaceIJK, Overage};
 pub use ijk::{CoordIJ, CoordIJK};
 pub use latlng::{LatLng, LatLngIndexer};
 pub use localij::{LocalIJ, LocalIJK};

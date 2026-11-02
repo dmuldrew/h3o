@@ -98,6 +98,64 @@ impl FaceIJK {
         self.coord =
             directions_bits_from_ijk(self.coord, &mut bits, resolution);
 
+        self.finish_cell(bits)
+    }
+
+    /// Converts a `FaceIJK` address to the corresponding [`CellIndex`], reusing
+    /// the coarse part of the previous address encoded through `cache` (at
+    /// the same resolution).
+    ///
+    /// A digit only depends on the `IJK` coordinates at its resolution and at
+    /// the parent resolution (not on the face), so once the walk up from the
+    /// finest resolution reaches an ancestor that the previous address also
+    /// had, all coarser digits and the resolution 0 coordinates are the same.
+    /// Neighbouring cells usually share all but their last digit or two. The
+    /// base cell lookup and rotation then run as usual, with this address's
+    /// face, so the result is always equal to [`Self::to_cell`].
+    pub(crate) fn to_cell_cached(
+        self,
+        resolution: Resolution,
+        cache: &mut EncodeCache,
+    ) -> CellIndex {
+        if resolution == Resolution::Zero {
+            return self.to_cell(resolution);
+        }
+
+        let filled = cache.filled;
+        debug_assert!(
+            !filled || bits::get_resolution(cache.bits) == resolution,
+            "one cache per resolution"
+        );
+        let mut bits = if filled {
+            cache.bits
+        } else {
+            bits::set_resolution(DEFAULT_CELL_INDEX, resolution)
+        };
+        let mut ijk = self.coord;
+        cache.ancestors[usize::from(resolution)] = ijk;
+        for res in Resolution::range(Resolution::One, resolution).rev() {
+            let direction;
+            (ijk, direction) = parent_and_direction(ijk, res);
+            // SAFETY: `res` is in [resolution; 1], thus valid.
+            bits = bits::set_direction(bits, direction.into(), res);
+
+            let parent = &mut cache.ancestors[usize::from(res) - 1];
+            if filled && *parent == ijk {
+                // Same ancestor: coarser digits are already in `bits`.
+                break;
+            }
+            *parent = ijk;
+        }
+        cache.filled = true;
+        cache.bits = bits;
+
+        Self::new(self.face, cache.ancestors[0]).finish_cell(bits)
+    }
+
+    /// Completes a cell index from its resolution 0 `FaceIJK` address (`self`)
+    /// and its unrotated direction digits: base cell lookup and rotation into
+    /// the base cell's canonical orientation.
+    fn finish_cell(self, mut bits: u64) -> CellIndex {
         // Lookup the correct base cell.
         let rotation = self.base_cell_rotation();
         bits = h3o_bit::set_base_cell(bits, rotation.base_cell.into());
@@ -561,24 +619,46 @@ fn directions_bits_from_ijk(
     resolution: Resolution,
 ) -> CoordIJK {
     for res in Resolution::range(Resolution::One, resolution).rev() {
-        let last_ijk = ijk;
-        let last_center = if res.is_class3() {
-            // Rotate CCW.
-            ijk = ijk.up_aperture7::<{ CCW }>();
-            ijk.down_aperture7::<{ CCW }>()
-        } else {
-            // Rotate CW.
-            ijk = ijk.up_aperture7::<{ CW }>();
-            ijk.down_aperture7::<{ CW }>()
-        };
-
-        let diff = (last_ijk - last_center).normalize();
-        let direction = Direction::try_from(diff).expect("unit IJK coordinate");
+        let direction;
+        (ijk, direction) = parent_and_direction(ijk, res);
         // SAFETY: `res` is in [resolution; 1], thus valid.
         *bits = bits::set_direction(*bits, direction.into(), res);
     }
 
     ijk
+}
+
+/// Returns the `IJK` coordinates of the parent (at `res - 1`) of the cell at
+/// `ijk` (at `res`), and the direction digit of that cell at `res`.
+fn parent_and_direction(
+    ijk: CoordIJK,
+    res: Resolution,
+) -> (CoordIJK, Direction) {
+    let (parent, center) = if res.is_class3() {
+        // Rotate CCW.
+        let parent = ijk.up_aperture7::<{ CCW }>();
+        (parent, parent.down_aperture7::<{ CCW }>())
+    } else {
+        // Rotate CW.
+        let parent = ijk.up_aperture7::<{ CW }>();
+        (parent, parent.down_aperture7::<{ CW }>())
+    };
+
+    let diff = (ijk - center).normalize();
+    let direction = Direction::try_from(diff).expect("unit IJK coordinate");
+    (parent, direction)
+}
+
+/// State kept between [`FaceIJK::to_cell_cached`] calls at one resolution.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncodeCache {
+    /// Whether an address was encoded yet.
+    filled: bool,
+    /// `IJK` coordinates of the last encoded address and of its ancestors,
+    /// indexed by resolution (down to the base cell at 0).
+    ancestors: [CoordIJK; h3o_bit::MAX_RESOLUTION as usize + 1],
+    /// Its unrotated direction digits, with the resolution set.
+    bits: u64,
 }
 
 // -----------------------------------------------------------------------------
@@ -996,3 +1076,7 @@ const FACE_IJK_BASE_CELLS: [[[[Rotation; 3]; 3]; 3]; NUM_ICOSA_FACES] = [
         ]
     ]
 ];
+
+#[cfg(test)]
+#[path = "./faceijk_tests.rs"]
+mod tests;
