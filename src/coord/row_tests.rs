@@ -416,5 +416,3 @@ fn invalid_or_large_noise_falls_back_to_to_cell() {
         assert_eq!(stats.fallbacks, width * JITTER_RESOLUTIONS.len());
     }
 }
-
-

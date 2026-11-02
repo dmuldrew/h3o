@@ -296,9 +296,6 @@ impl LatLng {
 pub struct LatLngIndexer {
     /// Last `FaceIJK` address and cell at each resolution.
     last: [Option<(FaceIJK, CellIndex)>; h3o_bit::MAX_RESOLUTION as usize + 1],
-    /// Ancestors and digits of the last encoded cell at each resolution, so
-    /// that a new cell only recomputes the digits it doesn't share with it.
-    encoded: [EncodeCache; h3o_bit::MAX_RESOLUTION as usize + 1],
 }
 
 impl LatLngIndexer {
@@ -348,19 +345,33 @@ impl LatLngIndexer {
         super::row::index_row(self, path, cols, resolutions, emit)
     }
 
-    pub(super) fn encode(
+    /// Like [`Self::encode`], but a new cell reuses the coarse digits of the
+    /// previous cell encoded through `cache` (see
+    /// [`FaceIJK::to_cell_cached`]). The cache lives with the caller, which
+    /// keeps the indexer itself small and cheap to create.
+    pub(super) fn encode_cached(
         &mut self,
         fijk: FaceIJK,
         resolution: Resolution,
+        cache: &mut EncodeCache,
     ) -> CellIndex {
         let last = &mut self.last[usize::from(resolution)];
         match *last {
             Some((last_fijk, cell)) if last_fijk == fijk => cell,
             _ => {
-                let cell = fijk.to_cell_cached(
-                    resolution,
-                    &mut self.encoded[usize::from(resolution)],
-                );
+                let cell = fijk.to_cell_cached(resolution, cache);
+                *last = Some((fijk, cell));
+                cell
+            }
+        }
+    }
+
+    fn encode(&mut self, fijk: FaceIJK, resolution: Resolution) -> CellIndex {
+        let last = &mut self.last[usize::from(resolution)];
+        match *last {
+            Some((last_fijk, cell)) if last_fijk == fijk => cell,
+            _ => {
+                let cell = fijk.to_cell(resolution);
                 *last = Some((fijk, cell));
                 cell
             }

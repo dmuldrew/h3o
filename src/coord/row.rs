@@ -13,8 +13,9 @@
 //! row instead of the number of pixels.
 
 use super::{
-    AP7_ROT_RADS, CoordIJK, FaceIJK, FaceProjection, INV_RES0_U_GNOMONIC,
-    LatLng, LatLngIndexer, SQRT3_2, SQRT7_POWERS, Vec2d, Vec3d,
+    AP7_ROT_RADS, CoordIJK, EncodeCache, FaceIJK, FaceProjection,
+    INV_RES0_U_GNOMONIC, LatLng, LatLngIndexer, SQRT3_2, SQRT7_POWERS, Vec2d,
+    Vec3d,
 };
 use crate::{
     CellIndex, Face, Resolution, face,
@@ -189,6 +190,9 @@ struct Level {
     cos: f64,
     sin: f64,
     run: Option<(usize, CellIndex)>,
+    /// Ancestors of the last cell encoded at this resolution, so that a new
+    /// cell only recomputes the digits it doesn't share with it.
+    encode_cache: EncodeCache,
 }
 
 impl Level {
@@ -205,6 +209,7 @@ impl Level {
             cos,
             sin,
             run: None,
+            encode_cache: EncodeCache::default(),
         }
     }
 
@@ -469,9 +474,11 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
                 let o = Vec2d::new(q.x - center.x, q.y - center.y);
                 if hex_margin(q, ijk) > required {
                     self.stats.decisions += 1;
-                    let cell = self
-                        .indexer
-                        .encode(FaceIJK::new(sa.face, ijk), resolution);
+                    let cell = self.indexer.encode_cached(
+                        FaceIJK::new(sa.face, ijk),
+                        resolution,
+                        &mut self.levels[index].encode_cache,
+                    );
                     self.levels[index].push(index, col, cell, &mut self.emit);
                     // Columns `col + k` stay in the hexagon with margin as
                     // long as `(o + k d)·n ≤ 0.5 - required` for each of the
