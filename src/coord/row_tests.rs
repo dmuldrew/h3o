@@ -598,3 +598,406 @@ fn dump_to_cell_positions() {
         writeln!(out, "{row}").unwrap();
     }
 }
+
+// -----------------------------------------------------------------------------
+// Large randomized equivalence run.
+//
+//     cargo test --release --lib index_row_equivalence -- --ignored --nocapture
+//
+// Environment: `H3O_EQUIV_ROWS` (default 10⁸), `H3O_EQUIV_SEED` (default 1),
+// `H3O_EQUIV_THREADS` (default: all cores), `H3O_EQUIV_CONTROL=1` to
+// understate every bound 10× (the run must then find mismatches), and
+// `H3O_EQUIV_ROW=<n>` to rerun a single row verbosely. Each row is generated
+// from `(seed, row number)` alone, so a reported row can be reproduced.
+#[expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::use_debug,
+    reason = "progress and failure report of a manual run"
+)]
+mod equivalence {
+    use super::*;
+
+    /// Divides a path's speed and acceleration bounds by 10 (controls).
+    struct Understated<P>(P);
+
+    impl<P: RowPath> RowPath for Understated<P> {
+        fn point(&mut self, i: usize) -> LatLng {
+            self.0.point(i)
+        }
+
+        fn speed_bound(&self) -> f64 {
+            self.0.speed_bound() / 10.
+        }
+
+        fn accel_bound(&self) -> f64 {
+            self.0.accel_bound() / 10.
+        }
+
+        fn noise_bound(&self) -> f64 {
+            self.0.noise_bound()
+        }
+
+        fn span_bounds(
+            &mut self,
+            first: usize,
+            last: usize,
+        ) -> Option<SpanBounds> {
+            self.0.span_bounds(first, last).map(|bounds| SpanBounds {
+                speed: bounds.speed / 10.,
+                accel: bounds.accel / 10.,
+                noise: bounds.noise,
+            })
+        }
+    }
+
+    fn splitmix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// The location `r` radians from `ll`, at azimuth `az`.
+    fn offset(ll: LatLng, r: f64, az: f64) -> LatLng {
+        let (lat, lng) = (ll.lat_radians(), ll.lng_radians());
+        let (sin_lat, cos_lat) = sin_cos(lat);
+        let (sin_r, cos_r) = sin_cos(r);
+        let (sin_az, cos_az) = sin_cos(az);
+        let lat2 =
+            libm::asin(mul_add(sin_lat, cos_r, cos_lat * sin_r * cos_az));
+        let lng2 = lng
+            + libm::atan2(
+                sin_az * sin_r * cos_lat,
+                mul_add(-sin_lat, libm::sin(lat2), cos_r),
+            );
+        LatLng::from_radians(lat2, lng2).expect("finite coordinate")
+    }
+
+    /// Kind of path in the equivalence run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EquivKind {
+        Parallel,
+        Segment,
+        SegmentPerSpan,
+        Jittered,
+    }
+
+    /// One randomly generated row of the equivalence run.
+    #[derive(Debug, Clone)]
+    struct EquivRow {
+        kind: EquivKind,
+        start: LatLng,
+        /// Step (radians per sample) along the path.
+        step: f64,
+        /// Heading (radians, from north) for segments.
+        heading: f64,
+        sigma: f64,
+        width: usize,
+        resolutions: Vec<Resolution>,
+    }
+
+    impl EquivRow {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            reason = "small positive values"
+        )]
+        fn generate(seed: u64, row: u64, specials: &[LatLng]) -> Self {
+            let mut next = rng(splitmix(seed ^ splitmix(row)));
+            let tau = core::f64::consts::TAU;
+            // Start: uniform, or close to a face center, a pentagon (icosahedron
+            // vertex: three faces meet), the antimeridian or a pole.
+            let uniform = LatLng::from(Vec3d::new(
+                mul_add(2., next(), -1.),
+                mul_add(2., next(), -1.),
+                mul_add(2., next(), -1.),
+            ));
+            let pick = next();
+            let near = 10_f64.powf(mul_add(7., next(), -8.)); // 1e-8 .. 0.1 rad
+            let start = if pick < 0.4 {
+                uniform
+            } else if pick < 0.95 {
+                let anchor =
+                    specials[(next() * specials.len() as f64) as usize];
+                offset(anchor, near, tau * next())
+            } else {
+                LatLng::from_radians(
+                    uniform.lat_radians(),
+                    core::f64::consts::PI - near * mul_add(2., next(), -1.),
+                )
+                .expect("finite")
+            };
+            // 1 to 3 resolutions; steps from 1/300 to 3 edges of the finest.
+            let mut resolutions = (0..=((next() * 3.) as usize))
+                .map(|_| {
+                    Resolution::try_from((next() * 16.) as u8)
+                        .expect("in range")
+                })
+                .collect::<Vec<_>>();
+            resolutions.dedup();
+            let finest = resolutions.iter().copied().max().expect("not empty");
+            let edge = 0.1738 / SQRT7_POWERS[usize::from(finest)];
+            let step = edge * 10_f64.powf(mul_add(3., next(), -2.5));
+            let width = 10_f64.powf(mul_add(1.7, next(), 1.)) as usize; // 10..500
+            let kind = match (next() * 10.) as u8 {
+                0..=3 => EquivKind::Parallel,
+                4..=5 => EquivKind::Segment,
+                6..=7 => EquivKind::SegmentPerSpan,
+                _ => EquivKind::Jittered,
+            };
+            Self {
+                kind,
+                start,
+                step,
+                heading: tau * next(),
+                sigma: step * 10_f64.powf(mul_add(3., next(), -5.)),
+                width,
+                resolutions,
+            }
+        }
+
+        fn parallel(&self) -> GeographicRow {
+            // Longitude step for an angular step `step` along the parallel.
+            let lat = self.start.lat_radians();
+            let dlng = self.step / cos(lat).max(1e-3);
+            GeographicRow::new(
+                lat.to_degrees(),
+                self.start.lng(),
+                dlng.to_degrees(),
+            )
+        }
+
+        /// Runs the row, returns the stats, the number of checked pairs and the
+        /// first mismatch (column, resolution, got, expected) with their count.
+        fn check(
+            &self,
+            control: bool,
+            runs: &mut Vec<(usize, Range<usize>, CellIndex)>,
+        ) -> (RowStats, usize, usize, Option<String>) {
+            match self.kind {
+                EquivKind::Parallel => {
+                    self.check_path(self.parallel(), control, runs)
+                }
+                EquivKind::Jittered => self.check_path(
+                    JitteredRow {
+                        row: self.parallel(),
+                        sigma: self.sigma,
+                        reported: self.sigma,
+                        seed: self.width as u64,
+                    },
+                    control,
+                    runs,
+                ),
+                EquivKind::Segment | EquivKind::SegmentPerSpan => {
+                    #[expect(clippy::cast_precision_loss, reason = "≤ 500")]
+                    let length = self.step * self.width as f64;
+                    let end = offset(self.start, length, self.heading);
+                    // Keep the longitude difference below π (no wrap-around).
+                    let mut end_lng = end.lng_radians();
+                    let tau = core::f64::consts::TAU;
+                    while end_lng - self.start.lng_radians()
+                        > core::f64::consts::PI
+                    {
+                        end_lng -= tau;
+                    }
+                    while self.start.lng_radians() - end_lng
+                        > core::f64::consts::PI
+                    {
+                        end_lng += tau;
+                    }
+                    let end = LatLng::from_radians(end.lat_radians(), end_lng)
+                        .expect("finite");
+                    let path =
+                        LatLngSegment::new(self.start, end, self.width as u64);
+                    if self.kind == EquivKind::SegmentPerSpan {
+                        self.check_path(path.per_span(), control, runs)
+                    } else {
+                        self.check_path(path, control, runs)
+                    }
+                }
+            }
+        }
+
+        fn check_path(
+            &self,
+            path: impl RowPath,
+            control: bool,
+            runs: &mut Vec<(usize, Range<usize>, CellIndex)>,
+        ) -> (RowStats, usize, usize, Option<String>) {
+            if control {
+                self.check_inner(Understated(path), runs)
+            } else {
+                self.check_inner(path, runs)
+            }
+        }
+
+        fn check_inner(
+            &self,
+            mut path: impl RowPath,
+            runs: &mut Vec<(usize, Range<usize>, CellIndex)>,
+        ) -> (RowStats, usize, usize, Option<String>) {
+            runs.clear();
+            let stats = LatLngIndexer::new().index_row(
+                &mut path,
+                0..self.width,
+                &self.resolutions,
+                |i, cols, cell| runs.push((i, cols, cell)),
+            );
+            // Runs must tile `0..width` at each resolution, in column order.
+            let mut next_col = vec![0; self.resolutions.len()];
+            let mut checked = 0;
+            let mut mismatches = 0;
+            let mut first = None;
+            for (i, cols, cell) in runs.iter() {
+                assert_eq!(
+                    cols.start, next_col[*i],
+                    "{self:?}: runs out of order"
+                );
+                assert!(!cols.is_empty(), "{self:?}: empty run");
+                next_col[*i] = cols.end;
+                let res = self.resolutions[*i];
+                for col in cols.clone() {
+                    let expected = path.point(col).to_cell(res);
+                    checked += 1;
+                    if expected != *cell {
+                        mismatches += 1;
+                        first.get_or_insert_with(|| {
+                            std::format!(
+                                "column {col} res {res}: {cell} instead of {expected}"
+                            )
+                        });
+                    }
+                }
+            }
+            assert!(
+                next_col.iter().all(|&end| end == self.width),
+                "{self:?}: runs don't cover the row"
+            );
+            (stats, checked, mismatches, first)
+        }
+    }
+
+    #[test]
+    #[ignore = "long: run with --release, see the comment above"]
+    #[expect(clippy::cast_precision_loss, reason = "statistics")]
+    #[expect(clippy::too_many_lines, reason = "one self-contained driver")]
+    fn index_row_equivalence() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        };
+
+        const CHUNK: u64 = 10_000;
+
+        let var = |name: &str| std::env::var(name).ok();
+        let seed = var("H3O_EQUIV_SEED").map_or(1, |v| v.parse().unwrap());
+        let control = var("H3O_EQUIV_CONTROL").is_some_and(|v| v == "1");
+        let specials = (0..20)
+            .map(|f| {
+                let c = face::CENTER_POINT[f];
+                LatLng::from(Vec3d::new(c.x, c.y, c.z))
+            })
+            .chain(
+                CellIndex::base_cells()
+                    .filter(|cell| cell.is_pentagon())
+                    .map(LatLng::from),
+            )
+            .chain([
+                LatLng::new(90., 0.).unwrap(),
+                LatLng::new(-90., 0.).unwrap(),
+            ])
+            .collect::<Vec<_>>();
+
+        if let Some(row) = var("H3O_EQUIV_ROW") {
+            let row = EquivRow::generate(seed, row.parse().unwrap(), &specials);
+            let result = row.check(control, &mut Vec::new());
+            std::println!("{row:#?}\n{result:?}");
+            return;
+        }
+
+        let rows: u64 =
+            var("H3O_EQUIV_ROWS").map_or(100_000_000, |v| v.parse().unwrap());
+        let threads = var("H3O_EQUIV_THREADS").map_or_else(
+            || std::thread::available_parallelism().map_or(1, usize::from),
+            |v| v.parse().unwrap(),
+        );
+        let cursor = AtomicU64::new(0);
+        let done = AtomicU64::new(0);
+        let total = Mutex::new((RowStats::default(), 0_u64, 0_u64, Vec::new()));
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let mut runs = Vec::new();
+                    loop {
+                        let first = cursor.fetch_add(CHUNK, Ordering::Relaxed);
+                        if first >= rows {
+                            break;
+                        }
+                        let mut stats = RowStats::default();
+                        let (mut checked, mut mismatches) = (0, 0);
+                        let mut failures = Vec::new();
+                        for row in first..(first + CHUNK).min(rows) {
+                            let equiv =
+                                EquivRow::generate(seed, row, &specials);
+                            let (s, c, m, f) = equiv.check(control, &mut runs);
+                            stats.samples += s.samples;
+                            stats.fallbacks += s.fallbacks;
+                            stats.decisions += s.decisions;
+                            checked += c as u64;
+                            mismatches += m as u64;
+                            if let Some(f) = f {
+                                failures.push((row, f));
+                            }
+                        }
+                        let mut total = total.lock().unwrap();
+                        total.0.samples += stats.samples;
+                        total.0.fallbacks += stats.fallbacks;
+                        total.0.decisions += stats.decisions;
+                        total.1 += checked;
+                        total.2 += mismatches;
+                        for failure in failures {
+                            if total.3.len() < 20 {
+                                std::eprintln!(
+                                    "row {}: {}",
+                                    failure.0,
+                                    failure.1
+                                );
+                            }
+                            total.3.push(failure.0);
+                        }
+                        drop(total);
+                        let finished =
+                            done.fetch_add(CHUNK, Ordering::Relaxed) + CHUNK;
+                        if finished % (rows / 100).max(CHUNK) < CHUNK {
+                            std::eprintln!(
+                                "{:5.1}% ({finished} rows, {:.0} s)",
+                                100. * finished.min(rows) as f64 / rows as f64,
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let (stats, checked, mismatches, failed_rows) =
+            total.into_inner().unwrap();
+        std::println!(
+            "seed {seed}, control {control}: {rows} rows, {checked} (location, \
+             resolution) pairs checked against to_cell, {mismatches} mismatches \
+             in {} rows; {} samples, {} fallbacks, {} decisions; {:.0} s",
+            failed_rows.len(),
+            stats.samples,
+            stats.fallbacks,
+            stats.decisions,
+            started.elapsed().as_secs_f64()
+        );
+        if control {
+            assert!(mismatches > 0, "understated bounds never changed a cell");
+        } else {
+            assert_eq!(mismatches, 0, "rows {failed_rows:?}");
+        }
+    }
+}
