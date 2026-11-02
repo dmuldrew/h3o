@@ -140,6 +140,8 @@ struct LatLngSegment {
     inv_count: f64,
     speed: f64,
     accel: f64,
+    /// Whether to report bounds for each span (see `span_bounds`).
+    per_span: bool,
 }
 
 impl LatLngSegment {
@@ -167,7 +169,14 @@ impl LatLngSegment {
             inv_count: 1. / count,
             speed,
             accel: speed * speed,
+            per_span: false,
         }
+    }
+
+    /// Reports bounds for each span instead of path-wide ones.
+    fn per_span(mut self) -> Self {
+        self.per_span = true;
+        self
     }
 }
 
@@ -195,13 +204,63 @@ impl RowPath for LatLngSegment {
     fn accel_bound(&self) -> f64 {
         self.accel
     }
+
+    // With φ' = a and λ' = b constant:
+    //   |P'| = sqrt(a² + b² cos²φ) ≤ |a| + |b| cos φ
+    //   |P''| ≤ a² |∂φφP| + 2|ab| |∂φλP| + b² |∂λλP|
+    //         = a² + 2|ab| |sin φ| + b² cos φ ≤ a² + 2|ab| + b² cos φ
+    // with the largest cos φ over the span: φ is linear in the index, so at
+    // an end, or 1 if the span crosses the equator. Near a pole, these are
+    // much tighter than the path-wide (|a| + |b|) and (|a| + |b|)².
+    fn span_bounds(&mut self, first: usize, last: usize) -> Option<SpanBounds> {
+        if !self.per_span {
+            return Some(SpanBounds {
+                speed: self.speed,
+                accel: self.accel,
+                noise: 0.,
+            });
+        }
+        let (lat0, lat1) = (
+            self.point(first).lat_radians(),
+            self.point(last).lat_radians(),
+        );
+        let cos_max = if lat0.signum() == lat1.signum() {
+            cos(lat0).max(cos(lat1))
+        } else {
+            1.
+        };
+        let cos_max = mul_add(cos_max, 1. + 1e-9, 1e-12).min(1.);
+        let a = abs(self.end.0 - self.start.0) * self.inv_count;
+        let b = abs(self.end.1 - self.start.1) * self.inv_count;
+        Some(SpanBounds {
+            speed: mul_add(mul_add(b, cos_max, a), 1. + 1e-9, 1e-300),
+            accel: mul_add(
+                mul_add(b * b, cos_max, mul_add(a, a, 2. * a * b)),
+                1. + 1e-9,
+                1e-300,
+            ),
+            noise: 0.,
+        })
+    }
 }
 
-/// Indexes the segment samples and checks each against `to_cell`.
+/// Indexes the segment samples and checks each against `to_cell`, with
+/// path-wide bounds and with per-span bounds.
 fn check_segment(start: LatLng, end: LatLng, count: u64, res: &[Resolution]) {
-    let width = usize::try_from(count).expect("count");
+    check_segment_path(LatLngSegment::new(start, end, count), res);
+    check_segment_path(LatLngSegment::new(start, end, count).per_span(), res);
+}
+
+fn check_segment_path(mut path: LatLngSegment, res: &[Resolution]) {
+    let count = path.count;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "count is an integer ≤ 2^53"
+    )]
+    let width = count as usize;
+    let (start, end) = (path.point(0), path.point(width));
     let mut cells = vec![vec![None::<CellIndex>; width]; res.len()];
-    let mut path = LatLngSegment::new(start, end, count);
     LatLngIndexer::new().index_row(
         &mut path,
         0..width,
@@ -414,5 +473,94 @@ fn invalid_or_large_noise_falls_back_to_to_cell() {
         assert_eq!(mismatches, 0, "{reported}");
         assert_eq!(stats.decisions, 0, "{reported}");
         assert_eq!(stats.fallbacks, width * JITTER_RESOLUTIONS.len());
+    }
+}
+
+// Segments heading towards a pole with a large change in longitude: per-span
+// bounds shrink near the pole, so the same exact cells take less work.
+#[test]
+fn per_span_bounds_stay_exact_and_save_work() {
+    let resolutions = [Resolution::Nine, Resolution::Eleven];
+    let ll = |lat: f64, lng: f64| LatLng::new(lat, lng).expect("valid");
+    for (start, end, count) in [
+        (ll(60., 0.), ll(89.5, 180.), 20_000),
+        (ll(-50., 20.), ll(-89., -160.), 10_000),
+        (ll(70., -170.), ll(85., 170.), 20_000),
+        (ll(70., -170.), ll(85., 170.), 400_000),
+    ] {
+        let width = usize::try_from(count).expect("count");
+        let (global, mismatches) = count_mismatches(
+            &mut LatLngSegment::new(start, end, count),
+            width,
+            &resolutions,
+        );
+        assert_eq!(mismatches, 0, "path-wide bounds, {start} -> {end}");
+        let (per_span, mismatches) = count_mismatches(
+            &mut LatLngSegment::new(start, end, count).per_span(),
+            width,
+            &resolutions,
+        );
+        assert_eq!(mismatches, 0, "per-span bounds, {start} -> {end}");
+        assert!(
+            per_span.samples + per_span.fallbacks
+                < global.samples + global.fallbacks,
+            "{start} -> {end}: {per_span:?} vs {global:?}"
+        );
+    }
+}
+
+/// A geographic row whose locations in `hole` lie on no smooth path at all
+/// (scattered over the globe). Spans that touch the hole report no bounds.
+struct HoleRow {
+    row: GeographicRow,
+    hole: Range<usize>,
+}
+
+impl RowPath for HoleRow {
+    #[expect(clippy::cast_precision_loss, reason = "test")]
+    fn point(&mut self, i: usize) -> LatLng {
+        if self.hole.contains(&i) {
+            let lat = ((i * 7919) % 1700) as f64 / 10. - 85.;
+            let lng = ((i * 104_729) % 3600) as f64 / 10. - 180.;
+            LatLng::new(lat, lng).expect("valid")
+        } else {
+            self.row.point(i)
+        }
+    }
+
+    // Wrong inside the hole: only valid through `span_bounds`.
+    fn speed_bound(&self) -> f64 {
+        self.row.speed_bound()
+    }
+
+    fn accel_bound(&self) -> f64 {
+        self.row.accel_bound()
+    }
+
+    fn span_bounds(&mut self, first: usize, last: usize) -> Option<SpanBounds> {
+        (last < self.hole.start || first >= self.hole.end).then(|| SpanBounds {
+            speed: self.row.speed_bound(),
+            accel: self.row.accel_bound(),
+            noise: 0.,
+        })
+    }
+}
+
+#[test]
+fn spans_without_bounds_use_to_cell() {
+    let width = 3000;
+    for (hole, step) in
+        [(1000..1200, 2.7e-4), (0..10, 9e-5), (2990..3000, 9e-3)]
+    {
+        let len = hole.len();
+        let mut path = HoleRow {
+            row: GeographicRow::new(39.7, -105.0, step),
+            hole,
+        };
+        let (stats, mismatches) =
+            count_mismatches(&mut path, width, &JITTER_RESOLUTIONS);
+        assert_eq!(mismatches, 0, "{:?}", path.hole);
+        assert!(stats.decisions > 0, "the rest still interpolates");
+        assert!(stats.fallbacks >= len * JITTER_RESOLUTIONS.len());
     }
 }

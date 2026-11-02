@@ -266,6 +266,7 @@ pub use base_cell::BaseCell;
 pub use boundary::Boundary;
 pub use coord::{
     CoordIJ, GeographicRow, LatLng, LatLngIndexer, LocalIJ, RowPath, RowStats,
+    SpanBounds,
 };
 pub use direction::Direction;
 pub use face::{Face, FaceSet};

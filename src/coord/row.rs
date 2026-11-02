@@ -55,6 +55,44 @@ pub trait RowPath {
     fn noise_bound(&self) -> f64 {
         0.
     }
+
+    /// Bounds for the locations `first..=last` only, or `None` to index them
+    /// with [`LatLng::to_cell`].
+    ///
+    /// The speed, acceleration and noise bounds above must hold for the whole
+    /// call. Paths whose motion varies a lot along the path can report tighter
+    /// bounds per span here: spans then get a smaller error margin, can be
+    /// longer, and fall back less. Returning `None` covers stretches where no
+    /// bound exists, such as near a pole or a projection singularity, without
+    /// giving up on the rest of the path.
+    ///
+    /// The returned bounds must hold for every location in `first..=last` and
+    /// for the smooth path between them; the indexer may use them for any
+    /// part of that range. It asks once per span, before computing the span's
+    /// samples. The default returns the path-wide bounds.
+    fn span_bounds(&mut self, first: usize, last: usize) -> Option<SpanBounds> {
+        let _ = (first, last);
+        Some(SpanBounds {
+            speed: self.speed_bound(),
+            accel: self.accel_bound(),
+            noise: self.noise_bound(),
+        })
+    }
+}
+
+/// Bounds on how a [`RowPath`] moves over part of its locations (see
+/// [`RowPath::span_bounds`]), with the same meaning as
+/// [`RowPath::speed_bound`], [`RowPath::accel_bound`] and
+/// [`RowPath::noise_bound`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanBounds {
+    /// An upper bound on `|dP/di|` (radians per sample).
+    pub speed: f64,
+    /// An upper bound on `|d²P/di²|` (radians per sample²).
+    pub accel: f64,
+    /// An upper bound on the distance between a location and the smooth path
+    /// (radians).
+    pub noise: f64,
 }
 
 /// A row of a geographic (equirectangular) raster: constant latitude,
@@ -281,18 +319,75 @@ pub struct RowStats {
     pub decisions: usize,
 }
 
+/// Validated bounds for a span, and what the indexer derives from them.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    speed: f64,
+    accel: f64,
+    noise: f64,
+    /// `max |Q''|` of the gnomonic plane position along the path, per sample²
+    /// (tangent-plane units).
+    curvature: f64,
+}
+
+impl Bounds {
+    /// `None` for NaN, negative or infinite bounds, or noise above
+    /// `MAX_NOISE`: those locations use `to_cell`.
+    fn new(bounds: SpanBounds) -> Option<Self> {
+        let SpanBounds {
+            speed,
+            accel,
+            noise,
+        } = bounds;
+        let is_bound = |value: f64| (0. ..f64::INFINITY).contains(&value);
+        if !is_bound(speed)
+            || !is_bound(accel)
+            || !(0. ..=MAX_NOISE).contains(&noise)
+        {
+            return None;
+        }
+        // Q = P_perp / w with |P_perp| ≤ 1, w ≥ W_MIN, |P'|, |w'| ≤ V and
+        // |P''|, |w''| ≤ A:
+        //   |Q''| ≤ A/w + 2V²/w² + A/w² + 2V²/w³.
+        let v2 = speed * speed;
+        let curvature = accel / W_MIN
+            + 2. * v2 / (W_MIN * W_MIN)
+            + accel / (W_MIN * W_MIN)
+            + 2. * v2 / (W_MIN * W_MIN * W_MIN);
+        Some(Self {
+            speed,
+            accel,
+            noise,
+            curvature,
+        })
+    }
+
+    /// Longest span whose interpolation error stays near `TARGET_MARGIN` at
+    /// the finest requested resolution (scale `finest`).
+    fn span_len(&self, finest: f64) -> usize {
+        if self.curvature <= 0. {
+            return MAX_SPAN;
+        }
+        // Interpolation error over `h` samples: INV_RES0_U * h²/8 * |Q''|.
+        let h = sqrt(
+            8. * TARGET_MARGIN
+                / (finest * INV_RES0_U_GNOMONIC * self.curvature),
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped below"
+        )]
+        let h = h.min(MAX_SPAN_F64) as usize;
+        h.max(1)
+    }
+}
+
 struct Row<'a, P, E> {
     indexer: &'a mut LatLngIndexer,
     path: &'a mut P,
     emit: E,
     levels: Vec<Level>,
-    speed: f64,
-    accel: f64,
-    /// `RowPath::noise_bound`, validated.
-    noise: f64,
-    /// `max |Q''|` of the gnomonic plane position along the path, per sample²
-    /// (tangent-plane units).
-    curvature: f64,
     /// Last exact location, for fallbacks at several resolutions.
     last_point: Option<(usize, LatLng)>,
     stats: RowStats,
@@ -309,73 +404,50 @@ pub(super) fn index_row(
     if cols.is_empty() || resolutions.is_empty() {
         return RowStats::default();
     }
-    let speed = path.speed_bound();
-    let accel = path.accel_bound();
-    let noise = path.noise_bound();
-    // NaN, negative or too large: no interpolation at all.
-    let exact_only = !(0. ..=MAX_NOISE).contains(&noise);
-    // Q = P_perp / w with |P_perp| ≤ 1, w ≥ W_MIN, |P'|, |w'| ≤ V and
-    // |P''|, |w''| ≤ A:
-    //   |Q''| ≤ A/w + 2V²/w² + A/w² + 2V²/w³.
-    let v2 = speed * speed;
-    let curvature = accel / W_MIN
-        + 2. * v2 / (W_MIN * W_MIN)
-        + accel / (W_MIN * W_MIN)
-        + 2. * v2 / (W_MIN * W_MIN * W_MIN);
-
     let finest = resolutions
         .iter()
         .map(|&res| SQRT7_POWERS[usize::from(res)])
         .fold(0., f64::max);
-    // Interpolation error over `h` samples: INV_RES0_U * h²/8 * |Q''|.
-    let span = if curvature > 0. {
-        let h = sqrt(
-            8. * TARGET_MARGIN / (finest * INV_RES0_U_GNOMONIC * curvature),
-        );
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "clamped below"
-        )]
-        let h = h.min(MAX_SPAN_F64) as usize;
-        h.max(1)
-    } else {
-        MAX_SPAN
-    };
+    // First span length from the path-wide bounds; afterwards, from the
+    // previous span's bounds.
+    let mut len = Bounds::new(SpanBounds {
+        speed: path.speed_bound(),
+        accel: path.accel_bound(),
+        noise: path.noise_bound(),
+    })
+    .map_or(MAX_SPAN, |bounds| bounds.span_len(finest));
 
     let mut row = Row {
         indexer,
         path,
         emit,
         levels: resolutions.iter().copied().map(Level::new).collect(),
-        speed,
-        accel,
-        noise,
-        curvature,
         last_point: None,
         stats: RowStats::default(),
     };
 
-    if exact_only {
-        for col in cols.clone() {
-            row.exact(col);
-        }
-        for (index, level) in row.levels.iter_mut().enumerate() {
-            if let Some((start, cell)) = level.run.take() {
-                (row.emit)(index, start..cols.end, cell);
-            }
-        }
-        return row.stats;
-    }
-
     let mut a = cols.start;
-    let mut sa = row.sample(a);
+    // Exact sample at `a`, if the previous span computed it.
+    let mut sa = None;
     while a < cols.end {
-        let b = (a + span).min(cols.end);
-        let sb = row.sample(b);
-        row.span(a, sa, b, sb);
-        a = b;
-        sa = sb;
+        let b = (a + len).min(cols.end);
+        let bounds = row.path.span_bounds(a, b).and_then(Bounds::new);
+        if let Some(bounds) = bounds {
+            // The bounds hold on `a..=b`, hence on any shorter span from `a`.
+            len = bounds.span_len(finest);
+            let end = b.min(a + len);
+            let sa_ = sa.unwrap_or_else(|| row.sample(a));
+            let sb = row.sample(end);
+            row.span(a, sa_, end, sb, bounds);
+            a = end;
+            sa = Some(sb);
+        } else {
+            for col in a..b {
+                row.exact(col);
+            }
+            a = b;
+            sa = None;
+        }
     }
     for (index, level) in row.levels.iter_mut().enumerate() {
         if let Some((start, cell)) = level.run.take() {
@@ -406,7 +478,14 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
     /// Indexes columns `a..b`, given exact samples at `a` and `b`.
     #[expect(clippy::cast_precision_loss, reason = "span length ≤ MAX_SPAN")]
     #[expect(clippy::many_single_char_names, reason = "math notation")]
-    fn span(&mut self, a: usize, sa: Sample, b: usize, sb: Sample) {
+    fn span(
+        &mut self,
+        a: usize,
+        sa: Sample,
+        b: usize,
+        sb: Sample,
+        bounds: Bounds,
+    ) {
         let h = (b - a) as f64;
 
         // Every location of the span must have `sa.face` as closest face:
@@ -418,21 +497,21 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
             && sa.face_margin.min(sb.face_margin)
                 > mul_add(
                     h * h * 0.25,
-                    self.accel,
-                    mul_add(4., self.noise, 1e-13),
+                    bounds.accel,
+                    mul_add(4., bounds.noise, 1e-13),
                 );
         // ... and stay away from the face center, where `to_cell` is noisy.
         let r_lo = mul_add(
             -0.5 * h,
-            self.speed,
-            mul_add(-2., self.noise, sa.r.min(sb.r)),
+            bounds.speed,
+            mul_add(-2., bounds.noise, sa.r.min(sb.r)),
         );
         if !face_ok || r_lo < MIN_FACE_CENTER_DISTANCE {
             if b - a >= 2 {
                 let m = a + (b - a) / 2;
                 let sm = self.sample(m);
-                self.span(a, sa, m, sm);
-                self.span(m, sm, b, sb);
+                self.span(a, sa, m, sm, bounds);
+                self.span(m, sm, b, sb, bounds);
             } else {
                 self.exact(a);
             }
@@ -443,9 +522,9 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
         // Point noise σ moves the interpolated chord (through the samples)
         // and the location itself by ≤ σ * PLANE_PER_RADIAN each.
         let interpolation =
-            INV_RES0_U_GNOMONIC * h * h * 0.125 * self.curvature;
+            INV_RES0_U_GNOMONIC * h * h * 0.125 * bounds.curvature;
         let float_noise = FLOAT_NOISE * (1. + 1. / r_lo);
-        let point_noise = 2. * PLANE_PER_RADIAN * self.noise;
+        let point_noise = 2. * PLANE_PER_RADIAN * bounds.noise;
         let error0 = mul_add(2., float_noise, interpolation + point_noise);
 
         let (dx, dy) = ((sb.q.x - sa.q.x) / h, (sb.q.y - sa.q.y) / h);
