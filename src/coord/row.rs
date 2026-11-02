@@ -182,9 +182,9 @@ const _: () = assert!(MAX_NOISE + ROUNDING_NOISE <= COS_FACE_RADIUS - W_MIN);
 ///
 /// Measured against a 40-digit evaluation of the same projection on 100,000
 /// points (uniform, and log-spaced down to 3e-7 rad from face centers), at
-/// resolutions 0, 14 and 15: `a ≤ 3.75` and `b = 0.65`. 256 is far above
-/// both, and still costs nothing: at resolution 15 the resulting margin is
-/// ~5e-7 hex units against `TARGET_MARGIN`.
+/// resolutions 0, 14 and 15 (`tools/to_cell_noise.py`): `a ≤ 3.75` and
+/// `b = 0.65`. 256 is far above both, and still costs nothing: at resolution
+/// 15 the resulting margin is ~5e-7 hex units against `TARGET_MARGIN`.
 const TO_CELL_NOISE: f64 = 256. * f64::EPSILON;
 
 /// Point noise (radians) allowed on top of `RowPath::noise_bound`, so that

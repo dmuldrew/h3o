@@ -564,3 +564,37 @@ fn spans_without_bounds_use_to_cell() {
         assert!(stats.fallbacks >= len * JITTER_RESOLUTIONS.len());
     }
 }
+
+// Dumps `to_cell`'s floating-point hex-plane positions for the locations in
+// `$H3O_NOISE_IN` (one `lat lng` pair per line, as hexadecimal f64 bits in
+// radians) to `$H3O_NOISE_OUT`, one line per location: face, then x and y at
+// resolutions 0, 14 and 15 (hexadecimal f64 bits). Driven by
+// `tools/to_cell_noise.py`, which measures them against a high-precision
+// evaluation to check `TO_CELL_NOISE`.
+#[test]
+#[ignore = "run through tools/to_cell_noise.py"]
+fn dump_to_cell_positions() {
+    use std::{fmt::Write as _, io::Write as _};
+
+    let parse = |s: &str| f64::from_bits(u64::from_str_radix(s, 16).unwrap());
+    let input = std::env::var("H3O_NOISE_IN").unwrap();
+    let output = std::env::var("H3O_NOISE_OUT").unwrap();
+    let mut out =
+        std::io::BufWriter::new(std::fs::File::create(output).unwrap());
+    for line in std::fs::read_to_string(input).unwrap().lines() {
+        let (lat, lng) = line.split_once(' ').unwrap();
+        let ll = LatLng::from_radians(parse(lat), parse(lng)).unwrap();
+        let p = Vec3d::from(ll);
+        let (face, distance) = p.closest_face();
+        let projection = FaceProjection::new(p, face, distance);
+        let mut row = std::format!("{}", usize::from(face));
+        for q in [
+            projection.res0_xy(),
+            projection.to_vec2d(Resolution::Fourteen),
+            projection.to_vec2d(Resolution::Fifteen),
+        ] {
+            write!(row, " {:x} {:x}", q.x.to_bits(), q.y.to_bits()).unwrap();
+        }
+        writeln!(out, "{row}").unwrap();
+    }
+}
