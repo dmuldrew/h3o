@@ -650,8 +650,8 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
                     col += skip + 1;
                 } else {
                     self.stats.fallbacks += 1;
-                    let ll = self.point(col);
-                    let cell = self.indexer.to_cell(ll, resolution);
+                    let p = Vec3d::from(self.point(col));
+                    let cell = self.exact_cell(p, index);
                     self.levels[index].push(index, col, cell, &mut self.emit);
                     col += 1;
                 }
@@ -659,13 +659,21 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
         }
     }
 
+    /// `LatLng::to_cell` at level `index` of the location whose n-vector is
+    /// `p`: the same `FaceIJK` address, encoded through the recent cells.
+    fn exact_cell(&mut self, p: Vec3d, index: usize) -> CellIndex {
+        let level = &mut self.levels[index];
+        let fijk = FaceIJK::from_vec3d(p, level.resolution);
+        self.indexer
+            .encode_recent(fijk, level.resolution, &mut level.encode_cache)
+    }
+
     /// Indexes column `col` with `to_cell` at every resolution.
     fn exact(&mut self, col: usize) {
-        let ll = self.point(col);
+        let p = Vec3d::from(self.point(col));
         for index in 0..self.levels.len() {
             self.stats.fallbacks += 1;
-            let resolution = self.levels[index].resolution;
-            let cell = self.indexer.to_cell(ll, resolution);
+            let cell = self.exact_cell(p, index);
             self.levels[index].push(index, col, cell, &mut self.emit);
         }
     }
