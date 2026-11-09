@@ -141,41 +141,80 @@ pub fn first_axe(bits: u64) -> Option<NonZeroU8> {
 }
 
 /// Returns a cell rotated `count` time, by 60 degrees step.
-pub fn rotate60<const CCW: bool>(mut bits: u64, count: usize) -> u64 {
-    // Using specialization (through `rotate60_once`) actually pays off.
-    if count == 1 {
-        for resolution in
-            Resolution::range(Resolution::One, get_resolution(bits))
-        {
-            let direction =
-                Direction::new_unchecked(get_direction(bits, resolution));
-
-            bits = set_direction(
-                bits,
-                direction.rotate60_once::<CCW>().into(),
-                resolution,
-            );
-        }
-    } else {
-        for resolution in
-            Resolution::range(Resolution::One, get_resolution(bits))
-        {
-            let direction =
-                Direction::new_unchecked(get_direction(bits, resolution));
-
-            bits = set_direction(
-                bits,
-                direction.rotate60::<CCW>(count).into(),
-                resolution,
-            );
-        }
+pub fn rotate60<const CCW: bool>(bits: u64, count: usize) -> u64 {
+    let digits = digits_mask(get_resolution(bits));
+    let mut rotated = bits & digits;
+    let mut count = count % 6;
+    if count >= 3 {
+        rotated = digits_rotate180(rotated);
+        count -= 3;
+    }
+    for _ in 0..count {
+        rotated = digits_rotate60::<CCW>(rotated);
     }
 
-    bits
+    (bits & !digits) | rotated
+}
+
+/// Bit 0 of every 3-bit direction digit.
+const DIGIT_BIT0: u64 = 0x0000_0492_4924_9249;
+/// Bit 1 of every 3-bit direction digit.
+const DIGIT_BIT1: u64 = DIGIT_BIT0 << 1;
+/// Bit 2 of every 3-bit direction digit.
+const DIGIT_BIT2: u64 = DIGIT_BIT0 << 2;
+
+/// Mask of the direction digits used at `resolution` (resolutions 1 to
+/// `resolution`; the unused digits below them are excluded).
+fn digits_mask(resolution: Resolution) -> u64 {
+    DIRECTIONS_MASK & !((1 << resolution.direction_offset()) - 1)
+}
+
+/// Rotates every direction digit of `digits` by 60 degrees at once.
+///
+/// A digit is an IJK unit vector, one bit per axis (`i` = bit 2, `j` = bit
+/// 1, `k` = bit 0): an axis direction has one bit set, a direction between
+/// two axes has two. Rotating counterclockwise moves each axis to the next
+/// one (`k` → `i` → `j` → `k`), so an axis direction gains the bit of the
+/// axis it moves toward (`K` → `IK`) and a two-axis direction keeps only
+/// the bit both rotations agree on (`IK` → `I`):
+///
+/// - one bit set: `d | rot(d)`;
+/// - two bits set: `d & rot(d)`;
+///
+/// where `rot` rotates the three bits of each digit right (counterclockwise)
+/// or left (clockwise). The center (`0`) stays `0` either way.
+///
+/// Every digit must be a valid direction (0 to 6).
+const fn digits_rotate60<const CCW: bool>(digits: u64) -> u64 {
+    let rot = if CCW {
+        ((digits >> 1) & (DIGIT_BIT0 | DIGIT_BIT1))
+            | ((digits << 2) & DIGIT_BIT2)
+    } else {
+        ((digits << 1) & (DIGIT_BIT1 | DIGIT_BIT2))
+            | ((digits >> 2) & DIGIT_BIT0)
+    };
+    // Bit 0 of each digit with at least two bits set, spread to the digit.
+    let b1 = digits >> 1;
+    let b2 = digits >> 2;
+    let two = ((digits & b1) | (digits & b2) | (b1 & b2)) & DIGIT_BIT0;
+    let two = two * 0b111;
+
+    (two & digits & rot) | (!two & (digits | rot))
+}
+
+/// Rotates every direction digit of `digits` by 180 degrees at once: each
+/// non-center direction becomes its opposite (`7 - d`, its bitwise
+/// complement); the center stays `0`.
+///
+/// Every digit must be a valid direction (0 to 6).
+const fn digits_rotate180(digits: u64) -> u64 {
+    let nonzero = (digits | (digits >> 1) | (digits >> 2)) & DIGIT_BIT0;
+
+    digits ^ (nonzero * 0b111)
 }
 
 /// Returns a pentagonal cell rotated by 60 degrees.
-pub fn pentagon_rotate60<const CCW: bool>(mut bits: u64) -> u64 {
+pub fn pentagon_rotate60<const CCW: bool>(bits: u64) -> u64 {
     let res = get_resolution(bits);
     if res == Resolution::Zero {
         return bits;
@@ -184,33 +223,9 @@ pub fn pentagon_rotate60<const CCW: bool>(mut bits: u64) -> u64 {
     // Direction that would be rotated to the K axe (and thus require an
     // adjustment).
     let direction = if CCW { Direction::JK } else { Direction::IK }.axe();
+    let count = if first_axe(bits) == direction { 2 } else { 1 };
 
-    // Using specialization (through `rotate60_once`) actually pays off.
-    if first_axe(bits) == direction {
-        for resolution in Resolution::range(Resolution::One, res) {
-            let direction =
-                Direction::new_unchecked(get_direction(bits, resolution));
-
-            bits = set_direction(
-                bits,
-                direction.rotate60::<CCW>(2).into(),
-                resolution,
-            );
-        }
-    } else {
-        for resolution in Resolution::range(Resolution::One, res) {
-            let direction =
-                Direction::new_unchecked(get_direction(bits, resolution));
-
-            bits = set_direction(
-                bits,
-                direction.rotate60_once::<CCW>().into(),
-                resolution,
-            );
-        }
-    }
-
-    bits
+    rotate60::<CCW>(bits, count)
 }
 
 #[cfg(test)]
