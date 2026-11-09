@@ -631,7 +631,7 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
                 let o = Vec2d::new(q.x - center.x, q.y - center.y);
                 if hex_margin(q, ijk) > required {
                     self.stats.decisions += 1;
-                    let cell = self.indexer.encode_cached(
+                    let cell = self.indexer.encode_recent(
                         FaceIJK::new(sa.face, ijk),
                         resolution,
                         &mut self.levels[index].encode_cache,
