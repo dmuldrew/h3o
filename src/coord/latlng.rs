@@ -4,6 +4,7 @@ use crate::{
     error::InvalidLatLng,
     math::{Coord2d, asin, atan2, cos, mul_add, sin, sin_cos, sqrt},
 };
+use alloc::boxed::Box;
 use core::fmt;
 use float_eq::float_eq;
 
@@ -296,6 +297,45 @@ impl LatLng {
 pub struct LatLngIndexer {
     /// Last `FaceIJK` address and cell at each resolution.
     last: [Option<(FaceIJK, CellIndex)>; h3o_bit::MAX_RESOLUTION as usize + 1],
+    /// Recently encoded cells of [`Self::index_row`], allocated on first use.
+    recent: Option<Box<[RecentCell; RECENT_CELLS]>>,
+}
+
+/// Number of slots of the recent-cell table (a power of two).
+const RECENT_BITS: u32 = 9;
+const RECENT_CELLS: usize = 1 << RECENT_BITS;
+
+/// A slot of the direct-mapped table of recently encoded cells.
+#[derive(Debug, Clone, Copy)]
+struct RecentCell {
+    fijk: FaceIJK,
+    /// Resolution of `cell`, or `u8::MAX` for an empty slot.
+    resolution: u8,
+    /// Bits of the cell index.
+    cell: u64,
+}
+
+impl RecentCell {
+    const EMPTY: Self = Self {
+        fijk: FaceIJK {
+            face: crate::Face::new_unchecked(0),
+            coord: super::CoordIJK::new(0, 0, 0),
+        },
+        resolution: u8::MAX,
+        cell: 0,
+    };
+
+    /// Slot of an address: a multiplicative hash of the face, resolution and
+    /// coordinates, so that neighbouring cells land in different slots.
+    #[expect(clippy::cast_sign_loss, reason = "bit reinterpretation")]
+    fn slot(fijk: FaceIJK, resolution: Resolution) -> usize {
+        let c = fijk.coord;
+        let key = ((u64::from(c.i() as u32) << 32) | u64::from(c.j() as u32))
+            ^ (u64::from(c.k() as u32) << 16)
+            ^ (u64::from(u8::from(fijk.face)) << 56)
+            ^ (u64::from(u8::from(resolution)) << 48);
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - RECENT_BITS)) as usize
+    }
 }
 
 impl LatLngIndexer {
@@ -345,25 +385,33 @@ impl LatLngIndexer {
         super::row::index_row(self, path, cols, resolutions, emit)
     }
 
-    /// Like [`Self::encode`], but a new cell reuses the coarse digits of the
-    /// previous cell encoded through `cache` (see
-    /// [`FaceIJK::to_cell_cached`]). The cache lives with the caller, which
-    /// keeps the indexer itself small and cheap to create.
-    pub(super) fn encode_cached(
+    /// Like [`Self::encode`], but looks the address up among the recently
+    /// encoded cells instead of only the last one, and a new cell reuses the
+    /// coarse digits of the previous cell encoded through `cache` (see
+    /// [`FaceIJK::to_cell_cached`]); the cache lives with the caller. The
+    /// sample paths of a raster row, and neighbouring rows, cross the same
+    /// cells one after the other. A cell is a function of its `FaceIJK` address and resolution only, so a hit
+    /// returns exactly what encoding would.
+    pub(super) fn encode_recent(
         &mut self,
         fijk: FaceIJK,
         resolution: Resolution,
         cache: &mut EncodeCache,
     ) -> CellIndex {
-        let last = &mut self.last[usize::from(resolution)];
-        match *last {
-            Some((last_fijk, cell)) if last_fijk == fijk => cell,
-            _ => {
-                let cell = fijk.to_cell_cached(resolution, cache);
-                *last = Some((fijk, cell));
-                cell
-            }
+        let recent = self
+            .recent
+            .get_or_insert_with(|| Box::new([RecentCell::EMPTY; RECENT_CELLS]));
+        let entry = &mut recent[RecentCell::slot(fijk, resolution)];
+        if entry.resolution == u8::from(resolution) && entry.fijk == fijk {
+            return CellIndex::new_unchecked(entry.cell);
         }
+        let cell = fijk.to_cell_cached(resolution, cache);
+        *entry = RecentCell {
+            fijk,
+            resolution: u8::from(resolution),
+            cell: u64::from(cell),
+        };
+        cell
     }
 
     fn encode(&mut self, fijk: FaceIJK, resolution: Resolution) -> CellIndex {

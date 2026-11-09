@@ -1001,3 +1001,89 @@ mod equivalence {
         }
     }
 }
+
+// One indexer reused across rows, as raster callers do: cells remembered from
+// earlier rows (other faces, resolutions and sample paths, and slots reused by
+// colliding addresses) must never leak into later ones.
+#[test]
+#[expect(clippy::needless_range_loop, reason = "column-major check")]
+fn reused_indexer_matches_to_cell() {
+    let mut next = rng(7);
+    let mut indexer = LatLngIndexer::new();
+    let sets: [&[Resolution]; 4] = [
+        &[Resolution::Nine],
+        &[Resolution::Five, Resolution::Nine],
+        &[Resolution::Twelve, Resolution::Seven, Resolution::Zero],
+        &[Resolution::Fifteen],
+    ];
+    for round in 0..400 {
+        let resolutions = sets[round % sets.len()];
+        let lat = mul_add(170., next(), -85.);
+        let lng0 = mul_add(360., next(), -180.);
+        // Several nearby rows (like the sample paths of a raster row), then
+        // jump elsewhere.
+        let step = mul_add(1e-3, next(), 1e-5);
+        let width = 300;
+        for offset in [0., 1e-4, 2e-4] {
+            let mut path = GeographicRow::new(lat + offset, lng0, step);
+            let mut cells =
+                vec![vec![None::<CellIndex>; width]; resolutions.len()];
+            indexer.index_row(
+                &mut path,
+                0..width,
+                resolutions,
+                |index, cols, cell| {
+                    for col in cols {
+                        assert!(
+                            cells[index][col].is_none(),
+                            "column {col} twice"
+                        );
+                        cells[index][col] = Some(cell);
+                    }
+                },
+            );
+            for col in 0..width {
+                let ll = path.point(col);
+                for (index, &res) in resolutions.iter().enumerate() {
+                    assert_eq!(
+                        cells[index][col],
+                        Some(ll.to_cell(res)),
+                        "round {round} lat {lat} col {col} res {res:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// The same `IJK` coordinates on every face and at every resolution: the 512
+// slots of the recent-cell table then collide, and a hit must still match the
+// face and resolution, not only the coordinates.
+#[test]
+fn recent_cells_key_on_face_and_resolution() {
+    let mut indexer = LatLngIndexer::new();
+    let coords = [
+        CoordIJK::new(0, 0, 0),
+        CoordIJK::new(1, 0, 0),
+        CoordIJK::new(0, 1, 0),
+        CoordIJK::new(0, 0, 1),
+        CoordIJK::new(1, 1, 0),
+    ];
+    for _ in 0..2 {
+        for coord in coords {
+            for face in 0..20 {
+                for res in
+                    Resolution::range(Resolution::One, Resolution::Fifteen)
+                {
+                    let fijk = FaceIJK::new(Face::new_unchecked(face), coord);
+                    let mut cache = EncodeCache::default();
+                    assert_eq!(
+                        indexer.encode_recent(fijk, res, &mut cache),
+                        fijk.to_cell(res),
+                        "{fijk:?} at {res:?}"
+                    );
+                }
+            }
+        }
+    }
+}
