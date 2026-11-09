@@ -267,6 +267,12 @@ struct Level {
     /// Ancestors of the last cell encoded at this resolution, so that a new
     /// cell only recomputes the digits it doesn't share with it.
     encode_cache: EncodeCache,
+    /// Likely hexagon of the next decision: the neighbour across the edge
+    /// the previous run left through, or the hexagon itself where the next
+    /// decision is the next span's first column. Only a guess: it is used
+    /// when it contains the position with margin, and the position is
+    /// rounded to its hexagon otherwise.
+    hint: Option<FaceIJK>,
 }
 
 impl Level {
@@ -284,6 +290,7 @@ impl Level {
             sin,
             run: None,
             encode_cache: EncodeCache::default(),
+            hint: None,
         }
     }
 
@@ -366,22 +373,68 @@ fn hex_margin(q: Vec2d, ijk: CoordIJK) -> f64 {
     0.5 - a.max(b).max(c)
 }
 
-/// Largest real `k ≥ 0` such that `(o + k d)·n ≤ limit` for each of the 6 hexagon
-/// edge normals `±n`, given that it holds for `k = 0`.
-fn exit_steps(o: Vec2d, d: Vec2d, limit: f64) -> f64 {
-    let normals = [(1., 0.), (0.5, SQRT3_2), (-0.5, SQRT3_2)];
-    let mut k = f64::INFINITY;
-    for (nx, ny) in normals {
-        let on = mul_add(o.x, nx, o.y * ny);
-        let dn = mul_add(d.x, nx, d.y * ny);
-        if dn > 0. {
-            k = k.min((limit - on) / dn);
-        } else if dn < 0. {
-            k = k.min((limit + on) / -dn);
-        }
+/// The edges a position moving by `d` per column can leave a hexagon
+/// through: for each pair of opposite edges, the outward normal facing `d`,
+/// `1 / (d·n)`, and the offset to the hexagon across that edge.
+#[derive(Debug, Clone, Copy)]
+struct ExitEdges([(Vec2d, f64, CoordIJK); 3]);
+
+impl ExitEdges {
+    fn new(d: Vec2d) -> Self {
+        // Edge normals, and the neighbours across the `+n` and `-n` edges.
+        let normals = [
+            (
+                Vec2d::new(1., 0.),
+                CoordIJK::new(1, 0, 0),
+                CoordIJK::new(0, 1, 1),
+            ),
+            (
+                Vec2d::new(0.5, SQRT3_2),
+                CoordIJK::new(1, 1, 0),
+                CoordIJK::new(0, 0, 1),
+            ),
+            (
+                Vec2d::new(-0.5, SQRT3_2),
+                CoordIJK::new(0, 1, 0),
+                CoordIJK::new(1, 0, 1),
+            ),
+        ];
+        Self(normals.map(|(n, plus, minus)| {
+            let dn = mul_add(d.x, n.x, d.y * n.y);
+            if dn < 0. {
+                (Vec2d::new(-n.x, -n.y), -1. / dn, minus)
+            } else {
+                // `dn = ±0` gives an infinite (or NaN, never smaller) count.
+                (n, 1. / abs(dn), plus)
+            }
+        }))
     }
-    // Callers truncate to an integer, which floors a non-negative value.
-    k.max(0.)
+
+    /// Largest real `k ≥ 0` such that `(o + k d)·n ≤ limit` for each of the
+    /// 6 edge normals `n`, given that it holds for `k = 0`, and the offset to
+    /// the hexagon across the edge that limits `k` (`None` if none does).
+    ///
+    /// Multiplying by the precomputed `1 / (d·n)` rounds once more than
+    /// dividing: `k` is within ~2ε of its exact value relatively, so a skipped
+    /// column passes `limit` by at most ~2ε·`travel` hex units, which the
+    /// `16ε · travel` term of the span's `required` margin covers.
+    #[expect(clippy::float_cmp, reason = "`k` is one of the `steps`")]
+    fn exit_steps(&self, o: Vec2d, limit: f64) -> (f64, Option<CoordIJK>) {
+        let steps = self.0.map(|(n, inv_dn, _)| {
+            (limit - mul_add(o.x, n.x, o.y * n.y)) * inv_dn
+        });
+        // `min` skips NaN (`0 * ∞` for an edge parallel to `d`).
+        let k = steps[0].min(steps[1]).min(steps[2]);
+        let exit = if steps[1] == k {
+            self.0[1].2
+        } else if steps[2] == k {
+            self.0[2].2
+        } else {
+            self.0[0].2
+        };
+        // Callers truncate to an integer, which floors a non-negative value.
+        (k.max(0.), (k < f64::INFINITY).then_some(exit))
+    }
 }
 
 /// Statistics about one `index_row` call.
@@ -612,6 +665,7 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
             // Per-column displacement at this resolution.
             let d = level.map(dx, dy);
             let travel = h * sqrt(mul_add(d.x, d.x, d.y * d.y));
+            let edges = ExitEdges::new(d);
             let margin = level.scale * error0;
 
             let mut col = a;
@@ -619,7 +673,6 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
                 let t = (col - a) as f64;
                 let q = self.levels[index]
                     .map(mul_add(t, dx, sa.q.x), mul_add(t, dy, sa.q.y));
-                let ijk = CoordIJK::from(q);
                 // Margin, plus rounding of the interpolation and plane mapping
                 // for any column of the span.
                 let required = mul_add(
@@ -627,6 +680,18 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
                     1. + abs(q.x) + abs(q.y) + travel,
                     margin,
                 );
+                // A hexagon containing `q` with margin is the one
+                // `CoordIJK::from(q)` returns (see `hex_margin`), so the
+                // hint, when it passes, decides exactly like rounding.
+                let ijk = match self.levels[index].hint.take() {
+                    Some(hint)
+                        if hint.face == sa.face
+                            && hex_margin(q, hint.coord) > required =>
+                    {
+                        hint.coord
+                    }
+                    _ => CoordIJK::from(q),
+                };
                 let center = Vec2d::from(ijk);
                 let o = Vec2d::new(q.x - center.x, q.y - center.y);
                 if hex_margin(q, ijk) > required {
@@ -640,14 +705,23 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
                     // Columns `col + k` stay in the hexagon with margin as
                     // long as `(o + k d)·n ≤ 0.5 - required` for each of the
                     // 6 edge normals ±n.
-                    let skip = exit_steps(o, d, 0.5 - required).min(h);
+                    let (skip, exit) = edges.exit_steps(o, 0.5 - required);
                     #[expect(
                         clippy::cast_possible_truncation,
                         clippy::cast_sign_loss,
                         reason = "non-negative, clamped to the span"
                     )]
-                    let skip = skip as usize;
+                    let skip = skip.min(h) as usize;
                     col += skip + 1;
+                    // The next decision is at `col` if `col <= b` (here or
+                    // as the next span's first column), past the edge that
+                    // stopped the skip; otherwise the next span starts
+                    // inside this hexagon.
+                    let next = match exit {
+                        Some(offset) if col <= b => (ijk + offset).normalize(),
+                        _ => ijk,
+                    };
+                    self.levels[index].hint = Some(FaceIJK::new(sa.face, next));
                 } else {
                     self.stats.fallbacks += 1;
                     let p = Vec3d::from(self.point(col));
@@ -664,8 +738,11 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
     fn exact_cell(&mut self, p: Vec3d, index: usize) -> CellIndex {
         let level = &mut self.levels[index];
         let fijk = FaceIJK::from_vec3d(p, level.resolution);
-        self.indexer
-            .encode_recent(fijk, level.resolution, &mut level.encode_cache)
+        self.indexer.encode_recent(
+            fijk,
+            level.resolution,
+            &mut level.encode_cache,
+        )
     }
 
     /// Indexes column `col` with `to_cell` at every resolution.
