@@ -2,7 +2,7 @@
 //!
 //! Along a row of a raster, consecutive pixel centers move smoothly over the
 //! sphere. Instead of projecting every pixel, the indexer projects a few
-//! samples exactly, linearly interpolates the hex-plane coordinates in
+//! samples, linearly interpolates the hex-plane coordinates in
 //! between, and only trusts the interpolated position when it is farther from
 //! any hexagon edge than a proven bound on the interpolation error plus the
 //! floating-point noise of `to_cell` itself. Pixels that don't clear the
@@ -13,13 +13,12 @@
 //! row instead of the number of pixels.
 
 use super::{
-    AP7_ROT_RADS, CoordIJK, EncodeCache, FaceIJK, FaceProjection,
-    INV_RES0_U_GNOMONIC, LatLng, LatLngIndexer, SQRT3_2, SQRT7_POWERS, Vec2d,
-    Vec3d,
+    AP7_ROT_RADS, CoordIJK, EncodeCache, FaceIJK, INV_RES0_U_GNOMONIC, LatLng,
+    LatLngIndexer, SQRT3_2, SQRT7_POWERS, Vec2d, Vec3d,
 };
 use crate::{
     CellIndex, Face, Resolution, face,
-    math::{abs, acos, cos, mul_add, sin_cos, sqrt},
+    math::{abs, cos, mul_add, sin_cos, sqrt},
 };
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -201,7 +200,7 @@ const ROUNDING_NOISE: f64 = 64. * f64::EPSILON;
 /// About `4 * TARGET_MARGIN` of the samples fall back to `to_cell`.
 const TARGET_MARGIN: f64 = 0.002;
 
-/// Longest span between two exact samples.
+/// Longest span between two samples.
 const MAX_SPAN: usize = 1024;
 #[expect(clippy::cast_precision_loss, reason = "small constant")]
 const MAX_SPAN_F64: f64 = MAX_SPAN as f64;
@@ -216,37 +215,92 @@ const MIN_FACE_CENTER_DISTANCE: f64 = 1e-6;
 const PLANE_PER_RADIAN: f64 =
     INV_RES0_U_GNOMONIC * (1. / W_MIN + 1. / (W_MIN * W_MIN));
 
-/// An exactly projected sample.
+/// A projected sample: a span endpoint.
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     face: Face,
     /// Resolution 0 hex-plane coordinates on `face`.
     q: Vec2d,
-    /// Angular distance to the face center.
+    /// Lower bound of the angular distance to the face center.
     r: f64,
     /// `min_g (P·c_face - P·c_g)`: how far the sample is from switching face.
     face_margin: f64,
 }
 
+/// Per face `f`, the vectors `(U, V)` such that the resolution 0 hex-plane
+/// position of a unit vector `P` on face `f` is `(U·P, V·P) / (c_f·P)`.
+///
+/// This is `FaceProjection`'s gnomonic projection without trigonometry: with
+/// `w = c_f·P = cos r` and `(north, east)` the tangent basis at `c_f`, the
+/// projection has radius `INV_RES0_U_GNOMONIC · tan r` and angle
+/// `θ = AXES_AZ_RADS_CII[f] - azimuth`, where `sin r cos(azimuth) = P·north`
+/// and `sin r sin(azimuth) = P·east`. Expanding `cos θ` and `sin θ` gives
+/// `U = k (cos A · north + sin A · east)` and
+/// `V = k (sin A · north - cos A · east)`, with `k = INV_RES0_U_GNOMONIC` and
+/// `A = AXES_AZ_RADS_CII[f]` (checked against that construction in the tests).
+#[rustfmt::skip]
+static GNOMONIC_AXES: [(Vec3d, Vec3d); face::CENTER_POINT.len()] = [
+    (Vec3d::new(1.0582481079152792, -1.9192531657001857, 1.4320196207780251), Vec3d::new(2.324367246572772, 0.4468321040201975, -1.1188207810575765)),
+    (Vec3d::new(2.545088785059307, -0.1695654490508665, 0.5898072574182244), Vec3d::new(0.25091634900079973, 2.583715918595601, -0.3399338230442603)),
+    (Vec3d::new(1.4375138472033573, 1.9860919099744792, 0.9182019551722918), Vec3d::new(-2.1692924145572476, 1.1499921509460418, 0.9087301244905305)),
+    (Vec3d::new(-0.7338457866232014, 1.568673709301658, 1.9633734034693553), Vec3d::new(-1.5916127927345063, -1.8729816825153476, 0.9015599265803314)),
+    (Vec3d::new(-0.9682449042715905, -0.8449622852623148, 2.2809301848338266), Vec3d::new(1.1856216117181806, -2.3075584910464912, -0.3515354469690264)),
+    (Vec3d::new(-1.1726290720943462, 0.2814382580315444, -2.323754619671581), Vec3d::new(-2.3243672465727725, -0.44683210402019674, 1.1188207810575752)),
+    (Vec3d::new(-1.5236245436121552, -0.13160698249408515, -2.1249352504279138), Vec3d::new(-0.25091634900080007, -2.583715918595601, 0.33993382304425995)),
+    (Vec3d::new(-1.262161568103046, -0.6404886554217372, -2.2024587225483714), Vec3d::new(2.1692924145572468, -1.1499921509460413, -0.9087301244905304)),
+    (Vec3d::new(-0.7495730909209263, -0.5419495850173022, -2.449190232488386), Vec3d::new(1.5916127927345063, 1.8729816825153482, -0.9015599265803308)),
+    (Vec3d::new(-0.6942389652899363, 0.027832582640108253, -2.524155219606439), Vec3d::new(-1.1856216117181804, 2.307558491046492, 0.3515354469690266)),
+    (Vec3d::new(0.7495730909209262, 0.541949585017302, 2.449190232488386), Vec3d::new(1.5916127927345065, 1.8729816825153482, -0.9015599265803307)),
+    (Vec3d::new(0.6942389652899362, -0.02783258264010782, 2.524155219606439), Vec3d::new(-1.1856216117181808, 2.3075584910464917, 0.3515354469690263)),
+    (Vec3d::new(1.1726290720943464, -0.2814382580315445, 2.3237546196715804), Vec3d::new(-2.3243672465727725, -0.4468321040201963, 1.1188207810575757)),
+    (Vec3d::new(1.5236245436121552, 0.13160698249408556, 2.1249352504279138), Vec3d::new(-0.2509163490008001, -2.583715918595601, 0.3399338230442604)),
+    (Vec3d::new(1.2621615681030467, 0.6404886554217365, 2.2024587225483714), Vec3d::new(2.1692924145572468, -1.1499921509460418, -0.908730124490531)),
+    (Vec3d::new(0.7338457866232014, -1.5686737093016585, -1.9633734034693553), Vec3d::new(-1.5916127927345058, -1.8729816825153476, 0.9015599265803317)),
+    (Vec3d::new(0.9682449042715913, 0.8449622852623138, -2.2809301848338266), Vec3d::new(1.1856216117181797, -2.307558491046492, -0.3515354469690256)),
+    (Vec3d::new(-1.058248107915278, 1.9192531657001854, -1.4320196207780251), Vec3d::new(2.324367246572772, 0.44683210402019635, -1.1188207810575757)),
+    (Vec3d::new(-2.545088785059307, 0.16956544905086762, -0.5898072574182244), Vec3d::new(0.25091634900080106, 2.5837159185956016, -0.3399338230442603)),
+    (Vec3d::new(-1.4375138472033577, -1.9860919099744785, -0.9182019551722916), Vec3d::new(-2.1692924145572468, 1.1499921509460422, 0.9087301244905305)),
+];
+
 impl Sample {
+    /// Projects `ll`. `face` and `face_margin` are those of
+    /// `Vec3d::closest_face` when the margin clears the 1e-13 allowance
+    /// of `face_ok` (closer faces fail it anyway); `q` is within ~30ε of the
+    /// exact resolution 0 position (rounding of the n-vector, the dot
+    /// products, the axes and the division, with `|U|, |V| ≈ 2.6` and
+    /// `w ≥ W_MIN`), well inside the `TO_CELL_NOISE` allowed for samples.
+    #[expect(clippy::many_single_char_names, reason = "math notation")]
     fn new(ll: LatLng) -> Self {
         let p = Vec3d::from(ll);
-        let (face, distance) = p.closest_face();
-        let q = FaceProjection::new(p, face, distance).res0_xy();
-        let r = acos(mul_add(distance, -0.5, 1.));
-        let center = face::CENTER_POINT[usize::from(face)];
-        let own = dot(&p, &center);
-        let face_margin = face::CENTER_POINT
-            .iter()
-            .enumerate()
-            .filter(|&(g, _)| g != usize::from(face))
-            .map(|(_, c)| own - dot(&p, c))
-            .fold(f64::INFINITY, f64::min);
+        let mut face = 0;
+        let mut own = f64::NEG_INFINITY;
+        let mut second = f64::NEG_INFINITY;
+        for (g, center) in face::CENTER_POINT.iter().enumerate() {
+            let w = dot(&p, center);
+            if w > own {
+                second = own;
+                own = w;
+                face = g;
+            } else if w > second {
+                second = w;
+            }
+        }
+        let (u, v) = GNOMONIC_AXES[face];
+        let q = Vec2d::new(dot(&p, &u) / own, dot(&p, &v) / own);
+        // tan r = |q| / k, and sin r = tan r / √(1 + tan² r) ≤ r. The
+        // estimate is within a few ε (absolute) of sin r: 64ε keeps it below.
+        let tan_r = sqrt(mul_add(q.x, q.x, q.y * q.y)) / INV_RES0_U_GNOMONIC;
+        let r = mul_add(
+            -64.,
+            f64::EPSILON,
+            tan_r / sqrt(mul_add(tan_r, tan_r, 1.)),
+        )
+        .max(0.);
         Self {
-            face,
+            face: Face::new_unchecked(face),
             q,
             r,
-            face_margin,
+            face_margin: own - second,
         }
     }
 }
@@ -440,7 +494,7 @@ impl ExitEdges {
 /// Statistics about one `index_row` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowStats {
-    /// Number of exactly projected span endpoints.
+    /// Number of projected span endpoints.
     pub samples: usize,
     /// Number of (pixel, resolution) pairs indexed with `to_cell`.
     pub fallbacks: usize,
@@ -558,7 +612,7 @@ pub(super) fn index_row(
     };
 
     let mut a = cols.start;
-    // Exact sample at `a`, if the previous span computed it.
+    // Sample at `a`, if the previous span computed it.
     let mut sa = None;
     while a < cols.end {
         let b = (a + len).min(cols.end);
@@ -606,7 +660,7 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
         Sample::new(ll)
     }
 
-    /// Indexes columns `a..b`, given exact samples at `a` and `b`.
+    /// Indexes columns `a..b`, given samples at `a` and `b`.
     #[expect(clippy::cast_precision_loss, reason = "span length ≤ MAX_SPAN")]
     #[expect(clippy::many_single_char_names, reason = "math notation")]
     fn span(
@@ -649,7 +703,10 @@ impl<P: RowPath, E: FnMut(usize, Range<usize>, CellIndex)> Row<'_, P, E> {
             return;
         }
 
-        // Bound on |true - interpolated| + 2 * float noise, at resolution 0.
+        // Bound on |true - interpolated| + 2 * float noise, at resolution 0:
+        // one float noise for the samples the chord goes through (within
+        // ~30ε, see `Sample::new`, far below `TO_CELL_NOISE`), one for
+        // `to_cell`'s position at the location.
         // Point noise σ moves the interpolated chord (through the samples)
         // and the location itself by ≤ σ * PLANE_PER_RADIAN each.
         let interpolation =

@@ -186,7 +186,7 @@ impl Vec3d {
     ///
     /// Will not work if `self` is at a pole, but icosahedron face centers
     /// are never at the poles.
-    fn tangent_basis(&self) -> (Self, Self) {
+    pub(crate) fn tangent_basis(&self) -> (Self, Self) {
         let mut north =
             linear_combination(1.0, &NORTH_POLE, -NORTH_POLE.dot(self), self);
         north.normalize();

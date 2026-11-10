@@ -1,3 +1,4 @@
+use super::super::FaceProjection;
 use super::*;
 use crate::{CellIndex, LatLng, LatLngIndexer, Resolution, math::mul_add};
 
@@ -1086,4 +1087,111 @@ fn recent_cells_key_on_face_and_resolution() {
             }
         }
     }
+}
+
+/// `(U, V)` of face `f`: the resolution 0 gnomonic position of `p` is
+/// `(U·p, V·p) / (c·p)`, from `FaceProjection`'s polar form.
+fn gnomonic_axes(f: usize) -> (Vec3d, Vec3d) {
+    let (north, east) = face::CENTER_POINT[f].tangent_basis();
+    let (sin_a, cos_a) = sin_cos(face::AXES_AZ_RADS_CII[f]);
+    let k = INV_RES0_U_GNOMONIC;
+    let u = Vec3d::new(
+        k * mul_add(cos_a, north.x, sin_a * east.x),
+        k * mul_add(cos_a, north.y, sin_a * east.y),
+        k * mul_add(cos_a, north.z, sin_a * east.z),
+    );
+    let v = Vec3d::new(
+        k * mul_add(sin_a, north.x, -cos_a * east.x),
+        k * mul_add(sin_a, north.y, -cos_a * east.y),
+        k * mul_add(sin_a, north.z, -cos_a * east.z),
+    );
+    (u, v)
+}
+
+#[test]
+fn gnomonic_axes_match_construction() {
+    for (f, &(u, v)) in GNOMONIC_AXES.iter().enumerate() {
+        let (eu, ev) = gnomonic_axes(f);
+        for (got, want) in [
+            (u.x, eu.x),
+            (u.y, eu.y),
+            (u.z, eu.z),
+            (v.x, ev.x),
+            (v.y, ev.y),
+            (v.z, ev.z),
+        ] {
+            assert!(
+                abs(got - want) <= 4. * f64::EPSILON * INV_RES0_U_GNOMONIC,
+                "face {f}: {got} vs {want}"
+            );
+        }
+    }
+}
+
+// Samples skip `FaceProjection`'s trigonometry: same face whenever the face
+// margin clears `face_ok`'s allowance, the same position within a few dozen
+// ε, and a radius that never exceeds the angular distance to the face
+// center.
+#[test]
+fn samples_match_face_projection() {
+    let mut next = rng(11);
+    let mut worst = 0_f64;
+    for i in 0..400_000 {
+        // Uniform on the sphere, plus points near face centers.
+        let ll = if i % 4 == 0 {
+            let c = face::CENTER_POINT[i % 20];
+            let e = 1e-3 * next();
+            let ll = LatLng::from(Vec3d::new(c.x, c.y, c.z));
+            LatLng::from_radians(
+                ll.lat_radians() + e * mul_add(2., next(), -1.),
+                ll.lng_radians() + e * mul_add(2., next(), -1.),
+            )
+            .unwrap()
+        } else {
+            LatLng::from_radians(
+                libm::asin(mul_add(2., next(), -1.)),
+                core::f64::consts::PI * mul_add(2., next(), -1.),
+            )
+            .unwrap()
+        };
+        let sample = Sample::new(ll);
+        let p = Vec3d::from(ll);
+        let (face, distance) = p.closest_face();
+        if sample.face_margin > 1e-13 {
+            assert_eq!(sample.face, face, "{ll}");
+        }
+        if sample.face != face {
+            continue;
+        }
+        let r = libm::acos(mul_add(distance, -0.5, 1.));
+        // `acos`'s own error near the face center is ~ε / r.
+        assert!(
+            sample.r <= r + f64::EPSILON / r.max(1e-300),
+            "{ll}: {} > {r}",
+            sample.r
+        );
+        assert!(
+            sample.r
+                >= libm::sin(r) - 1e-13 - 2. * f64::EPSILON / r.max(1e-300),
+            "{ll}: {} ≪ {r}",
+            sample.r
+        );
+        if r > 1e-4 {
+            let q = FaceProjection::new(p, face, distance).res0_xy();
+            let err = abs(sample.q.x - q.x).max(abs(sample.q.y - q.y));
+            if r > 0.1 {
+                worst = worst.max(err / f64::EPSILON);
+            }
+            // The reference has `to_cell`'s ~0.65 k ε / r error (see
+            // `TO_CELL_NOISE`) on top of the sample's own.
+            let allowed = mul_add(
+                INV_RES0_U_GNOMONIC,
+                f64::EPSILON / r,
+                64. * f64::EPSILON,
+            );
+            assert!(err <= allowed, "{ll}: {:?} vs {q:?}", sample.q);
+        }
+    }
+    // Where the reference is accurate, both agree to ~10ε (measured).
+    assert!(worst <= 32., "worst difference {worst} ε");
 }
