@@ -78,6 +78,7 @@ impl FaceProjection {
     /// Returns the Cartesian coordinates in the resolution 0 hex plane (the
     /// coordinates at resolution `r` are these scaled by `sqrt(7)^r`, and
     /// rotated for Class III).
+    #[cfg(test)]
     pub fn res0_xy(self) -> Vec2d {
         let Some((r0, theta)) = self.polar else {
             return Vec2d::new(0., 0.);
